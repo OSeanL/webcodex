@@ -105,6 +105,14 @@ fn decorate_model_wrapper_schema(tool_name: &str, schema: &mut Value) {
     let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
         return;
     };
+    if matches!(tool_name, "run_process" | "run_detached_process") {
+        let mut alias = properties.get("args").expect("process args schema").clone();
+        alias["description"] = Value::String(
+            "Compatibility spelling for args. Prefer args; if both are sent, their values must be identical."
+                .to_string(),
+        );
+        properties.insert("argv".to_string(), alias);
+    }
     if tool_supports_model_facing_assertion_name(tool_name) {
         properties.insert(
             TOOL_ASSERTION_NAME_FIELD.to_string(),
@@ -289,8 +297,10 @@ mod tests {
             for wrapper in [
                 "recording_session_id",
                 "ack_session_message_ids",
+                "ack_ref",
                 "context_request",
                 "session_message_resolution",
+                "_control",
             ] {
                 assert!(
                     !properties.contains_key(wrapper),
@@ -298,6 +308,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn business_session_schema_documents_short_ref_without_leaking_recorder_wrapper() {
+        let summary = input_schema_for_tool("session_summary");
+        let session = &summary["properties"]["session_id"];
+        assert_eq!(session["type"], "string");
+        assert!(
+            session.get("pattern").is_none(),
+            "model-facing business session_id must remain an unconstrained string selector; Runtime owns canonical/session_ref validation"
+        );
+        assert!(summary["properties"].get("recording_session_id").is_none());
     }
 
     #[test]

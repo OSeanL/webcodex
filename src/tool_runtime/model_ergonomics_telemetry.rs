@@ -4,15 +4,19 @@
 //! latency and transports finalize the record from the exact model-facing
 //! `ToolResult` projection before attaching it to the existing Action Audit row.
 
+pub(crate) mod job_convergence;
+
 use super::edit_tool_telemetry::{edit_tool_surface, EditToolSurface};
 use super::tool_definition::model_visible_tool_definitions;
 use super::{ToolResult, RECOVERY_KIND_VALUES};
 use crate::json_measurement::serialized_json_len;
+use crate::mcp_host::McpHostRuntimePolicy;
 use serde::Serialize;
 use serde_json::Value;
 #[cfg(test)]
 use std::time::Duration;
 use std::time::Instant;
+use webcodex_tool_contracts::tool_inputs::CodingGuidanceProfile;
 
 const MAX_STRUCTURED_KIND_BYTES: usize = 64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -35,8 +39,32 @@ enum WorkOnProjectMode {
 #[serde(rename_all = "snake_case")]
 enum WorkOnProjectGuidanceProfile {
     Direct,
+    HostCodeMode,
     CodeMode,
     Invalid,
+}
+
+impl WorkOnProjectGuidanceProfile {
+    fn explicit_request(self) -> Option<CodingGuidanceProfile> {
+        match self {
+            Self::Direct => Some(CodingGuidanceProfile::Direct),
+            Self::HostCodeMode => Some(CodingGuidanceProfile::HostCodeMode),
+            #[cfg(feature = "experimental-code-mode")]
+            Self::CodeMode => Some(CodingGuidanceProfile::CodeMode),
+            #[cfg(not(feature = "experimental-code-mode"))]
+            Self::CodeMode => None,
+            Self::Invalid => None,
+        }
+    }
+
+    fn from_effective(profile: CodingGuidanceProfile) -> Self {
+        match profile {
+            CodingGuidanceProfile::Direct => Self::Direct,
+            CodingGuidanceProfile::HostCodeMode => Self::HostCodeMode,
+            #[cfg(feature = "experimental-code-mode")]
+            CodingGuidanceProfile::CodeMode => Self::CodeMode,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -59,15 +87,18 @@ pub(crate) struct ModelErgonomicsTimer {
     started: Instant,
     finish_summary_only: Option<bool>,
     work_on_project: Option<WorkOnProjectErgonomicsFacts>,
+    bulk_exact_requested: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct ModelErgonomicsCompletion {
     tool_name: &'static str,
     tool_category: &'static str,
     duration_ms: u64,
     finish_summary_only: Option<bool>,
     work_on_project: Option<WorkOnProjectErgonomicsFacts>,
+    bulk_exact_requested: bool,
+    pub(crate) job_convergence: Option<job_convergence::JobConvergenceRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -91,7 +122,13 @@ pub(crate) struct ModelErgonomicsRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) edit_conflict_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) bulk_exact_outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) bulk_exact_match_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) work_on_project: Option<WorkOnProjectErgonomicsFacts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) job_convergence: Option<job_convergence::JobConvergenceRecord>,
 }
 
 impl ModelErgonomicsRecord {
@@ -109,6 +146,26 @@ impl ModelErgonomicsRecord {
 }
 
 impl ModelErgonomicsTimer {
+    pub(crate) fn resolve_work_on_project_guidance_profile(
+        &mut self,
+        policy: McpHostRuntimePolicy,
+        mcp_transport: bool,
+    ) {
+        let Some(facts) = self.work_on_project.as_mut() else {
+            return;
+        };
+        if facts.guidance_profile == WorkOnProjectGuidanceProfile::Invalid {
+            return;
+        }
+        let requested = facts
+            .guidance_profile_explicit
+            .then(|| facts.guidance_profile.explicit_request())
+            .flatten();
+        facts.guidance_profile = WorkOnProjectGuidanceProfile::from_effective(
+            policy.effective_guidance_profile(requested, mcp_transport),
+        );
+    }
+
     pub(crate) fn start(tool_name: &str) -> Option<Self> {
         Self::start_with_arguments(tool_name, &Value::Null)
     }
@@ -123,6 +180,22 @@ impl ModelErgonomicsTimer {
                 .unwrap_or(false)
         });
         let work_on_project = work_on_project_facts(tool_name, arguments);
+        let bulk_exact_requested = tool_name == "apply_text_edits"
+            && arguments
+                .get("changes")
+                .and_then(Value::as_array)
+                .is_some_and(|changes| {
+                    changes.iter().any(|change| {
+                        change
+                            .get("edits")
+                            .and_then(Value::as_array)
+                            .is_some_and(|edits| {
+                                edits
+                                    .iter()
+                                    .any(|edit| edit.get("expected_match_count").is_some())
+                            })
+                    })
+                });
         Some(Self {
             tool_name: definition.name,
             tool_category: definition.category,
@@ -130,6 +203,7 @@ impl ModelErgonomicsTimer {
 
             finish_summary_only,
             work_on_project,
+            bulk_exact_requested,
         })
     }
 
@@ -142,6 +216,8 @@ impl ModelErgonomicsTimer {
 
             finish_summary_only: self.finish_summary_only,
             work_on_project: self.work_on_project,
+            bulk_exact_requested: self.bulk_exact_requested,
+            job_convergence: None,
         }
     }
 
@@ -154,6 +230,8 @@ impl ModelErgonomicsTimer {
 
             finish_summary_only: self.finish_summary_only,
             work_on_project: self.work_on_project,
+            bulk_exact_requested: self.bulk_exact_requested,
+            job_convergence: None,
         }
     }
 }
@@ -224,8 +302,9 @@ impl ModelErgonomicsCompletion {
             )
         };
         let edit = edit_facts(self.tool_name, success, output);
+        let edit_uncertain = edit.outcome.as_deref() == Some("uncertain");
         ModelErgonomicsRecord {
-            schema_version: 7,
+            schema_version: 10,
             tool_name: self.tool_name,
             tool_category: self.tool_category,
             success,
@@ -240,7 +319,62 @@ impl ModelErgonomicsCompletion {
             edit_surface: edit.surface,
             edit_outcome: edit.outcome,
             edit_conflict_kind: edit.conflict_kind,
+            bulk_exact_outcome: self.bulk_exact_requested.then(|| {
+                if success {
+                    if output.get("dry_run").and_then(Value::as_bool) == Some(true) {
+                        "dry_run"
+                    } else {
+                        "success"
+                    }
+                } else if edit_uncertain {
+                    "uncertain"
+                } else {
+                    "rejection"
+                }
+                .to_string()
+            }),
+            bulk_exact_match_total: if self.bulk_exact_requested {
+                if success {
+                    Some(
+                        output
+                            .get("files")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .flat_map(|file| {
+                                file.get("edits")
+                                    .and_then(Value::as_array)
+                                    .into_iter()
+                                    .flatten()
+                            })
+                            .filter_map(|edit| {
+                                edit.get("expected_match_count")
+                                    .and_then(Value::as_u64)
+                                    .and_then(|_| edit.get("match_count").and_then(Value::as_u64))
+                            })
+                            .sum::<u64>()
+                            .min(327_680),
+                    )
+                } else {
+                    output
+                        .get("actual_match_count")
+                        .and_then(Value::as_u64)
+                        .map(|count| count.min(327_680))
+                }
+            } else {
+                None
+            },
             work_on_project: self.work_on_project,
+            job_convergence: self.job_convergence.clone().or_else(|| {
+                matches!(self.tool_name, "wait_for_job_terminal" | "observe_jobs").then(|| {
+                    job_convergence::JobConvergenceRecord {
+                        wait_for_job_terminal_count: u8::from(
+                            self.tool_name == "wait_for_job_terminal",
+                        ),
+                        ..Default::default()
+                    }
+                })
+            }),
         }
     }
 }
@@ -279,6 +413,9 @@ fn work_on_project_facts(
     let guidance_profile = match object.get("guidance_profile") {
         None => WorkOnProjectGuidanceProfile::Direct,
         Some(Value::String(profile)) if profile == "direct" => WorkOnProjectGuidanceProfile::Direct,
+        Some(Value::String(profile)) if profile == "host_code_mode" => {
+            WorkOnProjectGuidanceProfile::HostCodeMode
+        }
         Some(Value::String(profile))
             if cfg!(feature = "experimental-code-mode") && profile == "code_mode" =>
         {
@@ -390,6 +527,7 @@ fn edit_conflict_kind(output: &Value) -> Option<String> {
     matches!(
         value,
         "multiple_matches"
+            | "match_count_mismatch"
             | "match_not_found"
             | "occurrence_out_of_range"
             | "occurrence_outside_line_scope"
@@ -446,12 +584,89 @@ mod tests {
             .finish_after(Duration::from_millis(duration_ms))
     }
 
+    #[test]
+    fn bulk_exact_metrics_record_only_bounded_counts_and_outcomes() {
+        let args = json!({"changes":[{"path":"private.rs","edits":[{"kind":"replace_exact","old_text":"SECRET_OLD","new_text":"SECRET_NEW","expected_match_count":2}]}]});
+        let completion = ModelErgonomicsTimer::start_with_arguments("apply_text_edits", &args)
+            .unwrap()
+            .finish();
+        let dry = completion
+            .record_for_tool_result(&ToolResult::ok(json!({
+                "dry_run":true,"changed":false,"would_change":true,
+                "files":[{"edits":[{"expected_match_count":2,"match_count":2}]}]
+            })))
+            .unwrap();
+        assert_eq!(dry.bulk_exact_outcome.as_deref(), Some("dry_run"));
+        assert_eq!(dry.bulk_exact_match_total, Some(2));
+        let reject = completion.record_for_tool_result(&ToolResult::err_with_output(
+            "count mismatch", json!({"error_kind":"match_count_mismatch","actual_match_count":1,"state_changed":false,"execution_state":"not_started"})
+        )).unwrap();
+        assert_eq!(reject.bulk_exact_outcome.as_deref(), Some("rejection"));
+        assert_eq!(reject.bulk_exact_match_total, Some(1));
+        assert_eq!(
+            reject.edit_conflict_kind.as_deref(),
+            Some("match_count_mismatch")
+        );
+        let serialized = serde_json::to_string(&reject).unwrap();
+        assert!(!serialized.contains("SECRET_OLD"));
+        assert!(!serialized.contains("private.rs"));
+    }
+
     fn work_on_project_record(arguments: Value) -> ModelErgonomicsRecord {
         ModelErgonomicsTimer::start_with_arguments("work_on_project", &arguments)
             .expect("work_on_project telemetry")
             .finish_after(Duration::ZERO)
             .record_for_tool_result(&ToolResult::ok(json!({})))
             .expect("serializable telemetry")
+    }
+
+    #[test]
+    fn omitted_work_on_project_profile_records_effective_mcp_host_profile() {
+        let mut timer = ModelErgonomicsTimer::start_with_arguments(
+            "work_on_project",
+            &json!({"project":"agent:private:project","instruction":"private instruction"}),
+        )
+        .unwrap();
+        timer.resolve_work_on_project_guidance_profile(
+            crate::mcp_host::McpHostConfig {
+                profile: crate::mcp_host::McpHostProfile::HostCodeMode,
+                host_budget_secs: None,
+            }
+            .runtime_policy(),
+            true,
+        );
+        let record = timer
+            .finish_after(Duration::ZERO)
+            .record_for_tool_result(&ToolResult::ok(json!({})))
+            .unwrap();
+        let facts = record.work_on_project.unwrap();
+        assert_eq!(
+            facts.guidance_profile,
+            WorkOnProjectGuidanceProfile::HostCodeMode
+        );
+        assert!(!facts.guidance_profile_explicit);
+
+        let mut explicit = ModelErgonomicsTimer::start_with_arguments(
+            "work_on_project",
+            &json!({"project":"agent:private:project","instruction":"private instruction","guidance_profile":"direct"}),
+        )
+        .unwrap();
+        explicit.resolve_work_on_project_guidance_profile(
+            crate::mcp_host::McpHostConfig {
+                profile: crate::mcp_host::McpHostProfile::HostCodeMode,
+                host_budget_secs: None,
+            }
+            .runtime_policy(),
+            true,
+        );
+        let facts = explicit
+            .finish_after(Duration::ZERO)
+            .record_for_tool_result(&ToolResult::ok(json!({})))
+            .unwrap()
+            .work_on_project
+            .unwrap();
+        assert_eq!(facts.guidance_profile, WorkOnProjectGuidanceProfile::Direct);
+        assert!(facts.guidance_profile_explicit);
     }
 
     #[test]
@@ -481,7 +696,7 @@ mod tests {
         let record = completion("tool_manifest", 0)
             .record_for_tool_result(&ToolResult::ok(json!({})))
             .unwrap();
-        assert_eq!(record.schema_version, 7);
+        assert_eq!(record.schema_version, 10);
         assert_eq!(record.work_on_project, None);
         assert!(!serde_json::to_string(&record)
             .unwrap()
@@ -521,6 +736,21 @@ mod tests {
         assert!(facts.guidance_profile_explicit);
         assert_eq!(facts.include_extension_catalog, Some(false));
         assert!(facts.include_extension_catalog_explicit);
+    }
+
+    #[test]
+    fn work_on_project_host_code_mode_profile_is_not_feature_gated() {
+        let record = work_on_project_record(json!({
+            "project": "agent:private:project",
+            "instruction": "private instruction",
+            "guidance_profile": "host_code_mode"
+        }));
+        let facts = record.work_on_project.expect("work_on_project facts");
+        assert_eq!(
+            facts.guidance_profile,
+            WorkOnProjectGuidanceProfile::HostCodeMode
+        );
+        assert!(facts.guidance_profile_explicit);
     }
 
     #[test]
@@ -773,7 +1003,7 @@ mod tests {
             let record = completion("apply_text_edits", 0)
                 .record_for_tool_result(&result)
                 .unwrap();
-            assert_eq!(record.schema_version, 7);
+            assert_eq!(record.schema_version, 10);
             assert_eq!(record.edit_surface.as_deref(), Some("structured_or_patch"));
             assert_eq!(record.edit_outcome.as_deref(), outcome);
             assert_eq!(record.edit_conflict_kind.as_deref(), conflict_kind);
@@ -881,7 +1111,7 @@ mod tests {
                     .finish_after(Duration::ZERO)
                     .record_for_tool_result(&ToolResult::ok(json!({"private_body": "do-not-copy"})))
                     .unwrap();
-            assert_eq!(record.schema_version, 7);
+            assert_eq!(record.schema_version, 10);
             assert_eq!(record.finish_summary_only, Some(expected));
             assert!(record.serialized_result_bytes.is_some());
             let serialized = serde_json::to_string(&record).unwrap();

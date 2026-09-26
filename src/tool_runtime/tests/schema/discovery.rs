@@ -11,7 +11,7 @@ use webcodex_code_mode::{
 };
 
 #[tokio::test]
-async fn stop_job_manifest_remains_one_direct_canonical_mutation() {
+async fn stop_job_manifest_remains_one_gateway_canonical_mutation() {
     let mut result = test_runtime()
         .dispatch(ToolCall::ToolManifest {
             tool_name: Some("stop_job".into()),
@@ -24,14 +24,13 @@ async fn stop_job_manifest_remains_one_direct_canonical_mutation() {
     assert!(result.success, "{:?}", result.error);
     crate::tool_runtime::surface::sparsify_tool_manifest_model_result(&mut result);
     assert_eq!(result.output["name"], "stop_job");
-    assert_eq!(result.output["route"]["primary"]["mode"], "direct");
-    assert_eq!(result.output["route"]["primary"]["tool"], "stop_job");
-    assert_eq!(result.output["route"]["fallback"]["mode"], "gateway");
+    assert_eq!(result.output["route"]["primary"]["mode"], "gateway");
     assert_eq!(
-        result.output["route"]["fallback"]["tool"],
+        result.output["route"]["primary"]["tool"],
         "call_runtime_tool"
     );
-    assert_eq!(result.output["route"]["fallback"]["target"], "stop_job");
+    assert_eq!(result.output["route"]["primary"]["target"], "stop_job");
+    assert!(result.output["route"]["fallback"].is_null());
     assert_eq!(result.output["effect"], "mutate");
     assert_eq!(result.output["idempotency"], "desired_state");
     assert_eq!(
@@ -1822,6 +1821,18 @@ async fn code_mode_exact_manifest_projects_canonical_stage_callable_contracts() 
             projection["constraints"]["validation_after_successful_known_mutation"],
             policy.validation_after_mutation
         );
+        assert!(
+            projection["constraints"]
+                .get("nested_sync_wait_max_secs")
+                .is_none(),
+            "{entry_tool} must not expose internal return timing"
+        );
+        assert!(
+            !projection["examples"]
+                .to_string()
+                .contains("sync_wait_secs"),
+            "{entry_tool} examples must not teach hidden compatibility timing"
+        );
         let projected_names = projection["tools"]
             .as_array()
             .expect("projected callable tools")
@@ -1840,6 +1851,10 @@ async fn code_mode_exact_manifest_projects_canonical_stage_callable_contracts() 
             let input_properties = input["properties"]
                 .as_object()
                 .unwrap_or_else(|| panic!("{tool_name} projected input properties"));
+            assert!(
+                !input_properties.contains_key("sync_wait_secs"),
+                "{tool_name} callable projection must keep legacy sync_wait_secs hidden"
+            );
             assert!(
                 input_properties
                     .keys()
@@ -1865,6 +1880,12 @@ async fn code_mode_exact_manifest_projects_canonical_stage_callable_contracts() 
                     <= crate::tool_runtime::surface::CODE_MODE_OUTPUT_FIELDS_PER_TOOL_MAX,
                 "{tool_name} output projection exceeded its per-tool field bound: {}",
                 output_fields.len()
+            );
+            assert!(
+                output_fields.iter().all(|field| field
+                    .as_str()
+                    .is_none_or(|field| !field.contains("job_attention"))),
+                "{tool_name} nested callable projection must not advertise outer-only job_attention"
             );
             assert_eq!(
                 input["additionalProperties"], canonical.input_schema["additionalProperties"],
@@ -2079,13 +2100,12 @@ async fn tool_manifest_exact_tool_returns_input_contract_without_output_schema()
     assert!(contract["description"].as_str().is_some());
     assert_eq!(contract["input_schema"]["type"], "object");
     assert!(contract["input_schema"]["properties"]["package"].is_object());
-    let sync_wait = &contract["input_schema"]["properties"]["sync_wait_secs"];
-    assert_eq!(sync_wait["type"], "integer");
-    assert_eq!(sync_wait["minimum"], 1);
-    assert!(sync_wait.get("maximum").is_none());
-    assert!(sync_wait["description"]
-        .as_str()
-        .is_some_and(|description| description.to_ascii_lowercase().contains("clamp")));
+    assert!(
+        contract["input_schema"]["properties"]
+            .get("sync_wait_secs")
+            .is_none(),
+        "tool_manifest must not re-expose legacy sync_wait_secs tuning"
+    );
     assert!(contract["annotations"].is_object());
     let specs = registered_tool_specs();
     let manifest_spec = spec_named(&specs, "tool_manifest");
@@ -2115,6 +2135,100 @@ async fn tool_manifest_exact_tool_returns_input_contract_without_output_schema()
     assert_eq!(result.output["tools"][0]["availability"], "direct");
     assert!(result.output["tools"][0]["gateway_tool"].is_null());
     assert!(result.output["tools"][0].get("input_schema").is_none());
+}
+
+#[tokio::test]
+async fn exact_tool_manifest_projects_bounded_host_orchestration_from_tool_definition_only() {
+    let runtime = test_runtime();
+    let cases = [
+        (
+            "read_files",
+            json!({
+                "guidance_only": true,
+                "concurrency": "independent_parallel_read",
+                "native_batch_field": "items",
+                "compound_preferred": false,
+            }),
+        ),
+        (
+            "search_and_read",
+            json!({
+                "guidance_only": true,
+                "concurrency": "independent_parallel_read",
+                "native_batch_field": "queries",
+                "compound_preferred": true,
+            }),
+        ),
+        (
+            "cargo_check",
+            json!({
+                "guidance_only": true,
+                "concurrency": "sequential",
+                "native_batch_field": "packages",
+                "compound_preferred": false,
+            }),
+        ),
+    ];
+
+    for (tool_name, expected) in cases {
+        let result = runtime
+            .dispatch(ToolCall::ToolManifest {
+                tool_name: Some(tool_name.to_string()),
+                category: None,
+                intent: None,
+                include_recommended_flows: false,
+                include_risk_summary: false,
+            })
+            .await;
+        assert!(result.success, "{tool_name}: {:?}", result.error);
+        assert_eq!(result.output["host_orchestration"], expected, "{tool_name}");
+        assert_no_response_too_large(tool_name, &result.output);
+
+        let definition =
+            crate::tool_runtime::tool_definition::lookup_tool_definition(tool_name).unwrap();
+        assert_eq!(
+            result.output["host_orchestration"]["concurrency"],
+            definition.host_orchestration.concurrency.as_str(),
+            "{tool_name}"
+        );
+    }
+
+    let no_hint = runtime
+        .dispatch(ToolCall::ToolManifest {
+            tool_name: Some("run_shell".to_string()),
+            category: None,
+            intent: None,
+            include_recommended_flows: false,
+            include_risk_summary: false,
+        })
+        .await;
+    assert!(no_hint.success, "{:?}", no_hint.error);
+    assert!(no_hint.output.get("host_orchestration").is_none());
+
+    let specs = registered_tool_specs();
+    let manifest_spec = spec_named(&specs, "tool_manifest");
+    let output_properties = output_schema_properties(manifest_spec);
+    let schema = &output_properties["host_orchestration"];
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(
+        schema["properties"]["concurrency"]["enum"],
+        json!(["unspecified", "independent_parallel_read", "sequential"])
+    );
+
+    let specs = registered_tool_specs();
+    for tool_name in [
+        "read_files",
+        "search_project_texts",
+        "search_and_read",
+        "cargo_check",
+        "apply_text_edits",
+    ] {
+        let serialized = serde_json::to_string(spec_named(&specs, tool_name)).unwrap();
+        assert!(
+            !serialized.contains("host_orchestration"),
+            "{tool_name} default ToolSpec must not carry Host orchestration metadata"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2345,7 +2459,7 @@ async fn tool_manifest_routing_metadata_uses_canonical_adaptive_routes() {
         ("import_conversation_files_to_project", "direct", None),
         ("project_artifact", "direct", None),
         ("session_discussion_summary", "direct", None),
-        ("list_jobs", "direct", None),
+        ("list_jobs", "gateway", Some("call_runtime_tool")),
         ("git_diff_hunks", "direct", None),
         ("run_script", "direct", None),
         (

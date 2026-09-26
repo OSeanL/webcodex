@@ -251,8 +251,13 @@ export function projectReadinessLabel(value: ProjectReadiness, t: Translate) {
 }
 
 const operationKeys: Record<DesktopOperationKind, MessageKey> = {
+  runtime_probe: "operation.runtimeProbe",
+  runtime_switch: "operation.runtimeSwitch",
+  trace_update: "operation.traceUpdate",
+  configuration_restore: "operation.configurationRestore",
   local_setup: "operation.localSetup",
   local_project_activate: "operation.localProjectActivate",
+  project_unregister: "operation.projectUnregister",
   remote_setup: "operation.remoteSetup",
   quick_share_start: "operation.quickShareStart",
   quick_share_stop: "operation.quickShareStop",

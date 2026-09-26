@@ -145,6 +145,7 @@ async fn stateless_mcp_gateway_advertises_peer_ack_without_session_wrappers() {
     for field in [
         crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD,
         crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
+        crate::tool_runtime::window_collaboration::TOOL_CALL_WINDOW_REPLY_FIELD,
         crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD,
     ] {
         assert!(
@@ -626,6 +627,33 @@ fn stateless_workflow_recorder_metadata_adds_protocol_projection() {
         .find(|tool| tool["name"] == "read_files")
         .expect("Adaptive direct read_files schema");
     let read_files_output = serde_json::to_string(&read_files["outputSchema"]).unwrap();
+    let read_files_input = read_files["inputSchema"]["properties"]
+        .as_object()
+        .expect("read_files input properties");
+    assert!(
+        read_files_input
+            .get(crate::tool_runtime::window_collaboration::TOOL_CALL_WINDOW_REPLY_FIELD)
+            .is_some(),
+        "ordinary model-visible tools must advertise Window replies"
+    );
+    assert!(
+        read_files_output.contains("\"window_reply\""),
+        "ordinary model-visible output must admit the post-result reply receipt"
+    );
+    let mut gateway_payload = json!({
+        "tools": [{
+            "name": "call_runtime_tool",
+            "inputSchema": {"type": "object", "properties": {}},
+            "outputSchema": {"type": "object", "properties": {"output": {"type": "object", "properties": {}}}}
+        }]
+    });
+    add_stateless_workflow_recorder_metadata(&mut gateway_payload);
+    assert!(
+        gateway_payload["tools"][0]["inputSchema"]["properties"]
+            .get(crate::tool_runtime::window_collaboration::TOOL_CALL_WINDOW_REPLY_FIELD)
+            .is_some(),
+        "adaptive wrapper must advertise Window reply metadata"
+    );
     assert!(!serde_json::to_string(&full)
         .unwrap()
         .contains("\"recovery_required\""));
@@ -651,6 +679,7 @@ fn stateless_workflow_recorder_metadata_adds_protocol_projection() {
             );
         }
         assert!(input.get("ack_session_message_ids").is_some());
+        assert!(input.get("ack_ref").is_some());
     }
     assert!(!read_files_output.contains("session_continuity"));
     assert!(!read_files_output.contains("session_recovery"));
@@ -673,8 +702,13 @@ fn stateless_workflow_recorder_metadata_adds_protocol_projection() {
         .contains_key(crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD));
     assert!(!generic_properties
         .contains_key(crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD));
+    assert!(
+        !generic_properties.contains_key(crate::tool_runtime::sessions::TOOL_CALL_ACK_REF_FIELD)
+    );
     assert!(!generic_properties
         .contains_key(crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD));
+    assert!(!generic_properties
+        .contains_key(crate::tool_runtime::window_collaboration::TOOL_CALL_WINDOW_REPLY_FIELD));
     assert!(!generic_properties.contains_key("ack_session_context_revision"));
     assert!(!generic_properties
         .contains_key(crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD));
@@ -715,6 +749,31 @@ fn stateless_ack_wrapper_normalizes_and_is_removed_before_concrete_tool_parsing(
                 .collect::<Vec<_>>()
     });
     assert!(strip_stateless_ack_session_message_ids(&mut oversized).is_err());
+}
+
+#[test]
+fn stateless_ack_ref_wrapper_is_bounded_and_removed_before_concrete_parsing() {
+    let mut arguments = json!({
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_REF_FIELD: "  wc_ack1_example  "
+    });
+    let ack_ref = strip_stateless_ack_ref(&mut arguments).unwrap();
+    assert_eq!(ack_ref.as_deref(), Some("wc_ack1_example"));
+    assert!(arguments
+        .get(crate::tool_runtime::sessions::TOOL_CALL_ACK_REF_FIELD)
+        .is_none());
+    crate::tool_runtime::ToolCall::from_tool_name("list_tools", arguments)
+        .expect("ACK ref wrapper metadata must be gone before concrete parsing");
+
+    let mut wrong_type = json!({
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_REF_FIELD: ["wc_ack1_example"]
+    });
+    assert!(strip_stateless_ack_ref(&mut wrong_type).is_err());
+
+    let mut oversized = json!({
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_REF_FIELD:
+            "x".repeat(crate::tool_runtime::sessions::MAX_TOOL_CALL_ACK_REF_CHARS + 1)
+    });
+    assert!(strip_stateless_ack_ref(&mut oversized).is_err());
 }
 
 #[test]
@@ -807,20 +866,30 @@ fn stateless_invocation_metadata_stays_typed_and_business_arguments_stay_clean()
         "items": [{"path": "src/lib.rs"}],
         crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD: "wc_sess_adapter",
         crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD: ["wc_msg_abcd-efgh_ijklmn"],
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_REF_FIELD: "wc_ack1_fixture",
         crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD: {
             "message_id": "wc_msg_abcd-efgh_ijklmn",
             "resolution": "handled"
+        },
+        crate::tool_runtime::window_collaboration::TOOL_CALL_WINDOW_REPLY_FIELD: {
+            "reply_to": "wc_msg_abcd-efgh_ijklmn",
+            "message": "Tests are clean"
         },
         crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD: ["webcodex.workflow"],
     });
     let recording_session_id = strip_recording_session_id(&mut arguments).unwrap();
     let ack_session_message_ids = strip_stateless_ack_session_message_ids(&mut arguments).unwrap();
+    let ack_ref = strip_stateless_ack_ref(&mut arguments).unwrap();
     let session_message_resolution =
         strip_stateless_session_message_resolution(&mut arguments).unwrap();
+    let window_reply = strip_stateless_window_reply(&mut arguments).unwrap();
     let context_request = strip_stateless_context_request(&mut arguments).unwrap();
     let metadata = crate::tool_runtime::kernel::ToolInvocationMetadata {
+        control: None,
         ack_session_message_ids,
+        ack_ref,
         session_message_resolution,
+        window_reply,
         context_request,
     };
 
@@ -829,12 +898,22 @@ fn stateless_invocation_metadata_stays_typed_and_business_arguments_stay_clean()
         metadata.ack_session_message_ids,
         vec!["wc_msg_abcd-efgh_ijklmn"]
     );
+    assert_eq!(metadata.ack_ref.as_deref(), Some("wc_ack1_fixture"));
     assert_eq!(metadata.context_request, vec!["webcodex.workflow"]);
     assert!(metadata.session_message_resolution.is_some());
+    assert_eq!(
+        metadata
+            .window_reply
+            .as_ref()
+            .map(|reply| reply.message.as_str()),
+        Some("Tests are clean")
+    );
     for field in [
         crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD,
         crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_REF_FIELD,
         crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
+        crate::tool_runtime::window_collaboration::TOOL_CALL_WINDOW_REPLY_FIELD,
         crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD,
     ] {
         assert!(
@@ -1159,10 +1238,10 @@ async fn project_artifact_image_call_returns_native_image_for_remote_agent_proje
     let mut auth = crate::auth::AuthContext::new(crate::auth::AuthKind::Bootstrap);
     auth.is_bootstrap = true;
 
-    // Larger than the ordinary 256 KiB runner stdout cap: this proves the
-    // narrowly widened MCP image result path carries a real screenshot-sized
-    // response without silently tail-truncating its JSON/base64.
-    let mut image_bytes = vec![0u8; 300 * 1024];
+    // Larger than the legacy 1 MiB image cap and the ordinary 256 KiB runner
+    // stdout cap: this proves the widened native-image path carries a real large
+    // image without silently tail-truncating its JSON/base64.
+    let mut image_bytes = vec![0u8; 2 * 1024 * 1024];
     image_bytes[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
     let image_base64 = general_purpose::STANDARD.encode(&image_bytes);
     let sha256 = format!("{:x}", Sha256::digest(&image_bytes));
@@ -1496,18 +1575,27 @@ fn mcp_tools_list_inputs_equal_canonical_except_descriptions_and_host_file_overl
             let name = tool["name"].as_str().unwrap();
             let canonical = &specs[name];
             let mut expected = canonical.input_schema.clone();
-            // MCP Host rewrites these two required references; this is the only
-            // direct-input transport overlay, independent of description mode.
+            // MCP owns Host-file requiredness and runtime_status omission defaults;
+            // neither overlay mutates the canonical schema.
             if name == "import_conversation_files_to_project" {
                 expected["properties"]["openaiFileIdRefs"]["items"]["required"] =
                     json!(["download_url", "file_id"]);
+            }
+            let mut expected_description = canonical.description.clone();
+            if name == "runtime_status" {
+                assert_eq!(expected["properties"]["compact"]["default"], false);
+                expected["properties"]["compact"]["default"] = json!(true);
+                expected["properties"]["compact"]["description"] = json!("MCP defaults to sparse status. Set false for full diagnostics; summary_only=true still selects sparse.");
+                expected_description.push_str(
+                    " MCP defaults to sparse status; compact=false opts into full diagnostics.",
+                );
             }
             let mut actual = tool["inputSchema"].clone();
             if compact {
                 strip_description_text(&mut expected);
                 strip_description_text(&mut actual);
             } else {
-                assert_eq!(tool["description"], canonical.description, "{name}");
+                assert_eq!(tool["description"], expected_description, "{name}");
                 // Output schemas retain their existing MCP suggested-call
                 // routing overlays; compact discovery must not remove them here.
                 assert!(tool["outputSchema"].is_object(), "{name}");
@@ -1548,9 +1636,9 @@ async fn mcp_compact_preserves_stateless_wrappers_app_metadata_and_exact_manifes
                         assert!(tool.get("outputSchema").is_none());
                         let properties = &tool["inputSchema"]["properties"];
                         for (field, hint) in [
-                            ("recording_session_id", "wc_sess_*"),
+                            ("recording_session_id", "Recorder Session"),
                             ("ack_session_message_ids", "wc_msg_*"),
-                            ("session_message_resolution", "wc_msg_*"),
+                            ("session_message_resolution", "recording_session_id"),
                             ("context_request", "jobs.attention"),
                         ] {
                             if let Some(property) = properties.get(field) {
@@ -1640,7 +1728,7 @@ fn assert_compact_tool_diff(full: &Value, compact: &Value) {
     for (pointer, pattern) in [
         (
             "/properties/recording_session_id",
-            "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
+            "^(~s[1-9][0-9]{0,19}|wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32}))$",
         ),
         (
             "/properties/ack_session_message_ids/items",
@@ -1664,6 +1752,66 @@ fn assert_compact_tool_diff(full: &Value, compact: &Value) {
             );
             property.as_object_mut().unwrap().remove("pattern");
         }
+    }
+    // `_control` is the one intentional structural compacting exception. The
+    // full Stateless MCP schema remains the exact closed operational contract;
+    // compact tools/list keeps only an object selection entry so the same large
+    // canonical sidecar payload schemas are not repeated on every ordinary tool.
+    if let (Some(full_control), Some(compact_control)) = (
+        expected["inputSchema"]
+            .pointer("/properties/_control")
+            .cloned(),
+        actual["inputSchema"]
+            .pointer("/properties/_control")
+            .cloned(),
+    ) {
+        assert_eq!(full_control["type"], "object", "{name}");
+        assert_eq!(full_control["additionalProperties"], false, "{name}");
+        assert_eq!(
+            full_control["properties"]["before"]["maxProperties"], 1,
+            "{name}"
+        );
+        assert_eq!(
+            full_control["properties"]["after_success"]["maxProperties"], 1,
+            "{name}"
+        );
+        assert_eq!(compact_control["type"], "object", "{name}");
+        assert!(compact_control.get("properties").is_none(), "{name}");
+        expected["inputSchema"]["properties"]["_control"] = compact_control;
+    }
+    // window_reply is the other intentional structural compacting exception.
+    // Full discovery owns the exact closed reply contract; compact discovery
+    // keeps only the object entry because startup guidance carries the shape.
+    if let (Some(full_reply), Some(compact_reply)) = (
+        expected["inputSchema"]
+            .pointer("/properties/window_reply")
+            .cloned(),
+        actual["inputSchema"]
+            .pointer("/properties/window_reply")
+            .cloned(),
+    ) {
+        assert_eq!(full_reply["type"], "object", "{name}");
+        assert_eq!(full_reply["additionalProperties"], false, "{name}");
+        assert_eq!(
+            full_reply["properties"]["reply_to"]["pattern"],
+            "^wc_msg_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
+            "{name}"
+        );
+        assert_eq!(
+            full_reply["properties"]["message"]["minLength"], 1,
+            "{name}"
+        );
+        assert_eq!(
+            full_reply["properties"]["message"]["maxLength"], 8_000,
+            "{name}"
+        );
+        assert_eq!(
+            full_reply["required"],
+            json!(["reply_to", "message"]),
+            "{name}"
+        );
+        assert_eq!(compact_reply, json!({"type": "object"}), "{name}");
+        expected["inputSchema"]["properties"]["window_reply"] = compact_reply;
     }
     for tool in [&mut expected, &mut actual] {
         tool.as_object_mut().unwrap().remove("description");
@@ -1748,15 +1896,17 @@ async fn mcp_compact_preserves_safety_patterns_and_wrapper_bounds() {
         properties["context_request"]["items"]["maxLength"],
         crate::tool_runtime::context_projection::MAX_CONTEXT_REQUEST_KEY_CHARS
     );
-    for field in ["timeout_secs", "sync_wait_secs"] {
-        assert_eq!(properties[field]["minimum"], 1, "{field}");
-    }
+    assert_eq!(properties["timeout_secs"]["minimum"], 1);
+    assert!(
+        properties.get("sync_wait_secs").is_none(),
+        "legacy sync_wait_secs must stay hidden from MCP discovery"
+    );
 }
 
 #[test]
 fn mcp_compact_opaque_patterns_require_exact_wrapper_location_and_format() {
     use crate::mcp::discovery::compact_tool;
-    let session_pattern = "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$";
+    let session_pattern = "^(~s[1-9][0-9]{0,19}|wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32}))$";
     // Even at a known path, a future/different format must not silently vanish.
     for pattern in [
         "^wc_sess_[A-Za-z0-9_-]{16}$",
@@ -1791,6 +1941,34 @@ fn mcp_compact_opaque_patterns_require_exact_wrapper_location_and_format() {
         tool, once,
         "wrapper annotation projection must be idempotent"
     );
+}
+
+#[tokio::test]
+async fn mcp_recording_session_ref_fails_closed_when_malformed() {
+    let runtime = test_runtime();
+    let outcome = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(1)),
+            mcp_2026_params(adaptive_runtime_gateway_params(
+                "list_projects",
+                json!({
+                    crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD: "~s01"
+                }),
+            )),
+        ),
+        None,
+    )
+    .await;
+    let value = match outcome {
+        McpOutcome::BadRequest(value) => value,
+        other => panic!("expected malformed recorder ref BadRequest, got {other:?}"),
+    };
+    assert_eq!(value["error"]["code"], -32602);
+    assert!(value["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("unknown_session_ref")));
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -1898,21 +2076,6 @@ fn mcp_compact_common_copy_respects_tool_and_argument_boundaries() {
             vec!["Project-relative", "Skill resolution"],
         ),
         (
-            "run_detached_process",
-            "timeout_secs",
-            vec!["Total runtime", "604800"],
-        ),
-        (
-            "cargo_check",
-            "sync_wait_secs",
-            vec!["Same-execution", "10s", "55s", "timeout", "Never"],
-        ),
-        (
-            "run_shell",
-            "sync_wait_secs",
-            vec!["10s", "55s", "timeout", "return"],
-        ),
-        (
             "run_shell",
             "assertion_name",
             vec!["reuse after a fix", "validation-like"],
@@ -2004,20 +2167,12 @@ fn mcp_compact_descriptions_preserve_selection_and_schema_literals() {
             vec!["shell grammar", "related command chain", "observe_jobs"],
         ),
         (
-            "run_detached_process",
-            vec!["survives Runner", "idempotency_key", "same Job"],
-        ),
-        (
             "observe_jobs",
             vec![
                 "observation_token",
                 "after_observation_token",
                 "never redispatches",
             ],
-        ),
-        (
-            "list_jobs",
-            vec!["Recover or inventory", "observe_jobs directly"],
         ),
         (
             "wait_for_job_terminal",
@@ -2027,7 +2182,6 @@ fn mcp_compact_descriptions_preserve_selection_and_schema_literals() {
                 "Host continuation",
             ],
         ),
-        ("stop_job", vec!["confirm=true", "without stopping"]),
         (
             "present_agent_continuation",
             vec![
@@ -2122,6 +2276,73 @@ fn mcp_compact_descriptions_preserve_selection_and_schema_literals() {
     assert_eq!(tool["inputSchema"], original_schema);
 }
 
+// Test-only deterministic attribution. Byte parts partition the actual descriptor:
+// business includes the schema envelope; residual includes names/annotations.
+const DISCOVERY_WRAPPERS: &[&str] = &[
+    "recording_session_id",
+    "ack_session_message_ids",
+    "ack_ref",
+    "session_message_resolution",
+    "context_request",
+    "window_reply",
+    "_control",
+];
+
+fn discovery_cost(tool: &Value) -> (usize, usize, usize, usize, usize) {
+    let bytes = |value: &Value| serde_json::to_vec(value).unwrap().len();
+    let mut business = tool["inputSchema"].clone();
+    if let Some(properties) = business["properties"].as_object_mut() {
+        for key in DISCOVERY_WRAPPERS {
+            properties.remove(*key);
+        }
+    }
+    let schema = bytes(&business);
+    let wrappers = bytes(&tool["inputSchema"]) - schema;
+    let mut rest = tool.clone();
+    rest.as_object_mut().unwrap().remove("description");
+    let description = bytes(tool) - bytes(&rest);
+    let before = bytes(&rest);
+    rest.as_object_mut().unwrap().remove("_meta");
+    let app = before - bytes(&rest);
+    (bytes(tool), description, schema, wrappers, app)
+}
+
+fn report_discovery_costs(tools: &[Value]) {
+    let mut ranked: Vec<_> = tools
+        .iter()
+        .map(|tool| (tool, discovery_cost(tool)))
+        .collect();
+    ranked.sort_by(|(a, ac), (b, bc)| {
+        bc.0.cmp(&ac.0)
+            .then_with(|| a["name"].as_str().cmp(&b["name"].as_str()))
+    });
+    for (tool, (total, description, business, wrappers, app)) in ranked.iter().take(10) {
+        assert!(*total >= description + business + wrappers + app);
+        eprintln!("MCP_TOP name={} total={total} description={description} business={business} wrappers={wrappers} app={app}", tool["name"]);
+    }
+    for name in [
+        "list_jobs",
+        "stop_job",
+        "run_detached_process",
+        "wait_for_job_terminal",
+        "transfer_project_artifact",
+        "import_conversation_files_to_project",
+        "session_discussion_summary",
+        "session_handoff_summary",
+        "rotate_agent_continuation_endpoint",
+        "wait_for_agent_events",
+    ] {
+        let definition = webcodex_tool_contracts::lookup_tool_definition(name).unwrap();
+        if let Some((_, cost)) = ranked.iter().find(|(tool, _)| tool["name"] == name) {
+            eprintln!(
+                "MCP_CANDIDATE {name} rank={:?} bytes={}",
+                definition.adaptive_runtime_direct_rank(),
+                cost.0
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn mcp_tools_list_stateless_serialized_size_budget() {
     let mut scoped = crate::auth::shared_key_context("surface-size-test");
@@ -2132,14 +2353,13 @@ async fn mcp_tools_list_stateless_serialized_size_budget() {
     ]);
     let mut admin = scoped.clone();
     admin.scopes.push(crate::auth::SCOPE_ADMIN.to_string());
-    // Final Stateless result bytes (including wrappers/gateways, excluding the
-    // JSON-RPC envelope). Measurements: 85,676 / 88,360 / 99,384 bytes,
-    // plus 16,641 with Apps. About 10% byte headroom; new advertised tools
-    // require an explicit count-budget review, rather than silent growth.
+    // Final Stateless result bytes include wrappers/gateways, not the RPC
+    // envelope. Wrapper compaction and four gateway-only long-tail entries
+    // leave about 82/85/95 KB. Keep small explicit growth headroom.
     for (label, auth, max_tools, max_bytes) in [
-        ("anonymous", None, 34, 95_000),
-        ("scoped", Some(&scoped), 35, 98_000),
-        ("admin", Some(&admin), 41, 110_000),
+        ("anonymous", None, 30, 84_000),
+        ("scoped", Some(&scoped), 31, 87_000),
+        ("admin", Some(&admin), 37, 97_000),
     ] {
         for app_enabled in [false, true] {
             let mut sizes = Vec::new();
@@ -2159,6 +2379,13 @@ async fn mcp_tools_list_stateless_serialized_size_budget() {
                 let count = result["tools"].as_array().unwrap().len();
                 let bytes = serde_json::to_vec(result).unwrap().len();
                 let tools = result["tools"].as_array().unwrap();
+                if compact {
+                    let wrappers: usize = tools.iter().map(|tool| discovery_cost(tool).3).sum();
+                    eprintln!("MCP_WRAPPERS {label} app={app_enabled} bytes={wrappers}");
+                    if label == "admin" && app_enabled {
+                        report_discovery_costs(tools);
+                    }
+                }
                 let top_chars: usize = tools
                     .iter()
                     .map(|tool| tool["description"].as_str().unwrap().chars().count())
@@ -2173,12 +2400,11 @@ async fn mcp_tools_list_stateless_serialized_size_budget() {
                 } else {
                     0
                 };
-                // Goal Plan exposes one App-only sync primitive. The G4
-                // recheck tool was retired when state + recheck converged into
-                // goal_plan_sync, returning the App-only inventory delta to 16.
-                let count_budget = max_tools + if app_enabled { 16 } else { 0 } + feature_tools;
+                // Work Result v3 adds one bounded App-only collaboration adapter
+                // alongside the existing Goal Plan/continuation/read helpers.
+                let count_budget = max_tools + if app_enabled { 17 } else { 0 } + feature_tools;
                 let byte_budget =
-                    max_bytes + if app_enabled { 18_000 } else { 0 } + feature_tools * 4096;
+                    max_bytes + if app_enabled { 19_000 } else { 0 } + feature_tools * 4096;
                 if feature_tools == 0 {
                     assert_eq!(
                         count, count_budget,
@@ -2389,6 +2615,33 @@ async fn mcp_tools_call_list_projects_returns_content_blocks() {
     assert!(value["result"]["structuredContent"].is_object());
     // No server-side project config is normal; without registered agents,
     // list_projects succeeds with an empty project array.
+    assert_eq!(value["result"]["isError"], false);
+}
+
+#[tokio::test]
+async fn mcp_current_window_activity_requires_adapter_window_identity() {
+    let runtime = test_runtime();
+    let auth = crate::auth::shared_key_context("window-diagnostic-mcp");
+    let McpOutcome::Ok(value) = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(41)),
+            mcp_2026_params(adaptive_runtime_gateway_params(
+                "current_window_activity",
+                json!({"limit": 20}),
+            )),
+        ),
+        Some(&auth),
+    )
+    .await
+    else {
+        panic!("current_window_activity must be callable")
+    };
+    assert_eq!(
+        value["result"]["structuredContent"]["output"]["reason_code"],
+        "window_identity_unavailable"
+    );
     assert_eq!(value["result"]["isError"], false);
 }
 
@@ -2703,8 +2956,27 @@ async fn mcp_tools_call_rejects_legacy_session_alias_even_with_canonical_recorde
 
 #[tokio::test]
 async fn mcp_tools_call_records_event_with_recording_session_id() {
-    let runtime = test_runtime();
-    let session = runtime.sessions.start_session(None, None);
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime().with_project_reference_database(std::sync::Arc::new(
+        crate::Database::open(&tmp.path().join("recorder-refs.db")).unwrap(),
+    ));
+    let authority = crate::tool_runtime::workflow_session_authority_fingerprint(None)
+        .expect("local test principal should have stable authority");
+    let session = runtime
+        .sessions
+        .start_session_with_options(
+            crate::tool_runtime::SessionCreateOptions::new(
+                None,
+                Some("short recorder".to_string()),
+                crate::tool_runtime::SessionMode::Normal,
+                crate::tool_runtime::SessionGuards::default(),
+            )
+            .with_owner_authority_fingerprint(Some(authority)),
+        )
+        .unwrap();
+    let session_ref = runtime
+        .session_reference_for_id(&session.session_id, None)
+        .expect("test runtime should issue Session refs");
     let outcome = handle_mcp_request(
         &runtime,
         rpc(
@@ -2713,7 +2985,7 @@ async fn mcp_tools_call_records_event_with_recording_session_id() {
             mcp_2026_params(adaptive_runtime_gateway_params(
                 "list_projects",
                 json!({
-                    crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD: &session.session_id
+                    crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD: session_ref
                 }),
             )),
         ),
@@ -3109,7 +3381,7 @@ async fn project_grant_authority_is_identical_for_project_credential_and_share_o
             )
             .await;
         assert!(runners.success, "{label}: {:?}", runners.error);
-        let runner_ids = runners.output["agents"]
+        let runner_ids = runners.output["runners"]
             .as_array()
             .unwrap()
             .iter()
@@ -3385,4 +3657,83 @@ async fn mcp_tools_call_unknown_tool_is_bad_request() {
         }
         other => panic!("expected BadRequest, got {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn mcp_2026_control_sidecars_gateway_strip_and_closed_schema() {
+    let temp = tempfile::tempdir().unwrap();
+    let db =
+        std::sync::Arc::new(crate::db::Database::open(&temp.path().join("sidecars.db")).unwrap());
+    let runtime = test_runtime().with_communication_database(db);
+    let goal = runtime.create_goal_with_plan(
+        None,
+        crate::db::NewGoal {
+            title: "MCP sidecar".into(),
+            objective: "Prove wrapper stripping".into(),
+            controller_agent_id: None,
+            completion_conditions: vec!["contract verified".into()],
+            steps: vec![crate::db::NewGoalStep {
+                id: "inspect".into(),
+                title: "inspect".into(),
+            }],
+            idempotency_key: "create".into(),
+        },
+    );
+    assert!(goal.success);
+    let goal_id = &goal.output["goal"]["summary"]["goal_id"];
+    let control = json!({"before": {"goal_progress": {
+        "goal_id": goal_id, "expected_revision": 1, "completed_step_ids": ["inspect"],
+        "summary": "already inspected", "idempotency_key": "checkpoint"
+    }}});
+    for outer in [true, false] {
+        let mut arguments = json!({"tool": "get_goal", "arguments": {"goal_id": goal_id}});
+        if outer {
+            arguments["_control"] = control.clone();
+        } else {
+            arguments["arguments"]["_control"] = control.clone();
+        }
+        let outcome = handle_mcp_request(
+            &runtime,
+            rpc(
+                "tools/call",
+                Some(json!(601)),
+                mcp_2026_params(json!({"name": "call_runtime_tool", "arguments": arguments})),
+            ),
+            None,
+        )
+        .await;
+        let McpOutcome::Ok(value) = outcome else {
+            panic!("expected structured success")
+        };
+        let result = &value["result"]["structuredContent"];
+        assert_eq!(result["success"], true, "{value}");
+        assert_eq!(result["output"]["goal"]["summary"]["revision"], 2);
+        assert_eq!(result["output"]["control"]["before"]["replayed"], !outer);
+        assert_eq!(result["output"]["control"]["before"]["revision"], 2);
+    }
+    let rejected = handle_mcp_request(&runtime, rpc("tools/call", Some(json!(602)), mcp_2026_params(json!({"name": "call_runtime_tool", "arguments": {
+        "tool": "get_goal", "arguments": {"goal_id": goal_id}, "_control": {"before": {"unknown_private_value": {}}}
+    }}))), None).await;
+    let McpOutcome::BadRequest(value) = rejected else {
+        panic!("closed wrapper must reject")
+    };
+    assert!(!value.to_string().contains("unknown_private_value"));
+    let mut payload = json!({"tools": [
+        {"name": "get_goal", "inputSchema": webcodex_tool_contracts::input_schema_for_tool("get_goal"), "outputSchema": crate::tool_runtime::registry::output_schema_for_tool("get_goal")},
+        {"name": "goal_plan_sync", "inputSchema": webcodex_tool_contracts::input_schema_for_tool("goal_plan_sync")}
+    ]});
+    add_stateless_workflow_recorder_metadata(&mut payload);
+    assert_eq!(
+        payload["tools"][0]["inputSchema"]["properties"]["_control"]["properties"]["before"]
+            ["maxProperties"],
+        1
+    );
+    assert!(payload["tools"][1]["inputSchema"]["properties"]
+        .get("_control")
+        .is_none());
+    assert!(
+        webcodex_tool_contracts::input_schema_for_tool("get_goal")["properties"]
+            .get("_control")
+            .is_none()
+    );
 }

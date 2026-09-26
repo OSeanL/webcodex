@@ -7,10 +7,11 @@ use super::tool_definition::{
     tool_definitions, RunnerCapabilityRequirement, ToolActivityInteraction, ToolActivityKind,
     ToolActivityPresentation, ToolActivitySemantics, ToolAuditPolicy, ToolCompositionPolicy,
     ToolDefinition, ToolDiffReviewEvidence, ToolEffectAnnotations, ToolExecutionContract,
-    ToolExecutionForm, ToolExplorationEvidence, ToolGptActionExposure, ToolOperatorExtensionFamily,
-    ToolReviewEvidence, ToolSessionEvidencePolicy, ToolValidationIdentityKind,
-    PERMISSION_RISK_ARTIFACT_WRITE, PERMISSION_RISK_DESTRUCTIVE, PERMISSION_RISK_PATCH,
-    PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION, PERMISSION_RISK_WRITE, TOOL_CATEGORY_JOB,
+    ToolExecutionForm, ToolExplorationEvidence, ToolGptActionExposure, ToolHostOrchestrationHint,
+    ToolOperatorExtensionFamily, ToolReviewEvidence, ToolSessionEvidencePolicy,
+    ToolValidationIdentityKind, PERMISSION_RISK_ARTIFACT_WRITE, PERMISSION_RISK_DESTRUCTIVE,
+    PERMISSION_RISK_PATCH, PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION,
+    PERMISSION_RISK_WRITE, TOOL_CATEGORY_JOB,
 };
 
 impl ToolDefinition {
@@ -237,6 +238,12 @@ pub fn runtime_tool_composition_policy(name: &str) -> ToolCompositionPolicy {
         .unwrap_or(ToolCompositionPolicy::Denied)
 }
 
+pub fn runtime_tool_host_orchestration_hint(name: &str) -> ToolHostOrchestrationHint {
+    lookup_tool_definition(name)
+        .map(|definition| definition.host_orchestration)
+        .unwrap_or(ToolHostOrchestrationHint::UNSPECIFIED)
+}
+
 pub fn runtime_tool_session_evidence_policy(name: &str) -> ToolSessionEvidencePolicy {
     lookup_tool_definition(name)
         .map(|definition| definition.session_evidence_policy())
@@ -399,6 +406,25 @@ pub fn runtime_tool_permission_risk(name: &str) -> &'static str {
 
 pub fn is_model_visible_tool_name(name: &str) -> bool {
     lookup_tool_definition(name).is_some_and(|definition| definition.visibility.is_model_visible())
+}
+
+/// Whether an ordinary model-facing result may carry the passive Job-attention
+/// sidecar. Explicit Job lifecycle/control surfaces and the Window diagnostic
+/// remain self-describing and must not recursively consume the sidecar.
+pub fn runtime_tool_supports_passive_job_attention(name: &str) -> bool {
+    is_model_visible_tool_name(name)
+        && !matches!(
+            name,
+            "current_window_activity"
+                | "plugin_tool"
+                | "run_job"
+                | "run_detached_process"
+                | "observe_jobs"
+                | "list_jobs"
+                | "stop_job"
+                | "wait_for_job_terminal"
+                | "present_job_terminal_continuation"
+        )
 }
 
 #[cfg(any(test, feature = "root-test-support"))]

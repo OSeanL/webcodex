@@ -30,6 +30,7 @@ mod json_digest;
 mod json_measurement;
 mod mcp;
 mod mcp_gateway;
+mod mcp_host;
 mod model_surface;
 pub(crate) use webcodex_store::models;
 mod oauth_http;
@@ -125,6 +126,9 @@ where
             stdout: "Usage: webcodex-server [OPTIONS]\n\nRun the WebCodex server runtime.\n\nOptions:\n      --stop-on-stdin-eof  Stop when the invoking parent closes stdin\n  -h, --help               Print help and exit\n  -V, --version            Print version and exit\n".to_string(),
             stderr: String::new(),
         },
+        [arg] if arg == "--build-info-json" => ServerBinaryAction::Exit {
+            code: 0, stdout: build_info::build_info_json("webcodex-server"), stderr: String::new(),
+        },
         [arg] if matches!(arg.as_str(), "--version" | "-V") => ServerBinaryAction::Exit {
             code: 0,
             stdout: build_info::version_output("webcodex-server"),
@@ -207,6 +211,7 @@ pub async fn run_server_with_parent_liveness(
         );
     }
     let config = Config::from_env();
+    let mcp_host_policy = mcp_host::McpHostConfig::from_env().runtime_policy();
     let (acceptor, listener_mode, listener_addr) = server_listener::server_acceptor(&config.addr)
         .await
         .map_err(std::io::Error::other)?;
@@ -285,6 +290,7 @@ only for local/trusted-network demos."
     let runtime_state_dir = config.runtime_state_dir();
     let mut tool_runtime_builder =
         tool_runtime::ToolRuntime::new(runner_registry.clone(), runtime_info.clone())
+            .with_mcp_host_policy(mcp_host_policy)
             .with_window_activity_database(db.clone())
             .with_memory_database(db.clone())
             .with_project_reference_database(db.clone())
@@ -528,10 +534,21 @@ only for local/trusted-network demos."
                 .post(pairing_http::pairing_enroll),
         )
         .push(
-            authed_api_router.push(
-                Router::with_path(route_metadata::api_path(RouteId::PairingCreate))
-                    .post(pairing_http::pairing_create),
-            ),
+            authed_api_router
+                .push(
+                    Router::with_path(route_metadata::api_path(RouteId::PairingCreate))
+                        .post(pairing_http::pairing_create),
+                )
+                .push(
+                    Router::with_path(route_metadata::api_path(
+                        RouteId::RunnerCapabilityAuthorization,
+                    ))
+                    .post(pairing_http::runner_capability_authorization),
+                )
+                .push(
+                    Router::with_path(route_metadata::api_path(RouteId::PairingRunnerCapabilities))
+                        .post(pairing_http::grant_runner_capabilities),
+                ),
         );
 
     let openapi_router =

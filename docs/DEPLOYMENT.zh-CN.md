@@ -149,6 +149,26 @@ WebSocket continuity，也不宣称 literal zero interruption。
 boundary：installer 会 fail closed，避免与旧进程争抢地址。先停止 legacy Server，再用
 `--overwrite` 重新安装；这次首次迁移本身不保证无 gap。
 
+### MCP Host timing profile
+
+MCP 调用等待属于 Server 侧的 Host 适配，与 Runner execution timeout 分开配置。普通 MCP Host 使用默认的 `direct` profile，通常无需额外配置：
+
+```text
+WEBCODEX_MCP_HOST_PROFILE=direct
+```
+
+如果外部 Host 自带 native Code Mode/orchestration，并且整个 composition 的 wall-clock budget 约为 55 秒，可配置：
+
+```text
+WEBCODEX_MCP_HOST_PROFILE=host_code_mode
+# 可选：host_code_mode 本身默认就是 55 秒。
+WEBCODEX_MCP_HOST_BUDGET_SECS=55
+```
+
+`WEBCODEX_MCP_HOST_BUDGET_SECS` 表示 Host 侧单次 MCP call / composition 的预算，不是 command runtime。工具的 `timeout_secs` 仍表示真实 execution lifetime，可以远大于 Host budget。WebCodex 不会根据 `clientInfo`、User-Agent 或 Host 产品名自动推断 profile。
+
+`host_code_mode` 表示外部 MCP Host 提供的 orchestration，与 WebCodex experimental internal Code Mode 及其自身 nested-execution 防护不是同一个概念。`runtime_status` 会在 `effective_config.mcp_host` 中报告最终生效的非敏感 policy。
+
 ### Tool invocation trace
 
 Tool-request trace 是 **operator diagnostic**，默认关闭。轻量排障使用 metadata 模式；只有明确需要 request/response payload capture 时才使用 `full`：
@@ -399,9 +419,9 @@ curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
 
 `allowed_scopes` 限制 OAuth client 最多可以请求哪些权限。WebCodex 新增 permission 时不会静默扩大已有 client。要修改现有 client，请把期望保留的完整、非空 allow-list 提交到 `POST /api/oauth/clients/update_scopes`。真实变化会让旧 OAuth grant 失效并要求重新授权；提交相同 canonical list 是 no-op。安全模型见[认证](AUTH_MODEL.zh-CN.md#oauth2)。
 
-ChatGPT MCP host-file import 采用两级 trust。正常 active authenticated OAuth client 只能从 `files.oaiusercontent.com` 或其子域导入；这些 URL 仍要求 HTTPS、public DNS resolution + address pinning、443 端口、无 userinfo、禁止 redirect，并继续受 bounded download 与 Project write policy 约束。只有当某个 client 还需要从任意 public HTTPS host 导入时，才把其精确 server-generated OAuth client id 配入 `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`，获得同样 SSRF 防护下的 Tier 1 扩展信任。重新创建 client 会生成新 id，但普通 OpenAI-host attachment import 不再因此失效；更新该设置只用于恢复更宽的 Tier 1 trust。Client display name 与 redirect URI 永远不能授予 Tier 1 trust。
+ChatGPT MCP host-file import 采用两级 trust。正常 active authenticated OAuth client 只能从 OpenAI attachment host 导入：`files.oaiusercontent.com` 及其子域，以及严格匹配的 Sediment Azure Blob 账户 `oaisdmntpr<region>.blob.core.windows.net`；这些 URL 仍要求 HTTPS、public DNS resolution + address pinning、443 端口、无 userinfo、禁止 redirect，并继续受 bounded download 与 Project write policy 约束。只有当某个 client 还需要从任意 public HTTPS host 导入时，才把其精确 server-generated OAuth client id 配入 `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS`，获得同样 SSRF 防护下的 Tier 1 扩展信任。重新创建 client 会生成新 id，但普通 OpenAI-host attachment import 不再因此失效；更新该设置只用于恢复更宽的 Tier 1 trust。Client display name 与 redirect URI 永远不能授予 Tier 1 trust。
 
-对于绑定到 loopback、并通过 OpenAI Secure Tunnel 以本机注入 user API token 访问的 operator-controlled Server，还有一个独立的 local-only 例外。设置 `WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true` 后，可在该路径上信任 ChatGPT host-file rewrite。非 loopback bind 或非 user API credential 会忽略该 flag；network-accessible Server 应保持未设置。
+对于绑定到 loopback、并通过 OpenAI Secure Tunnel 访问的 operator-controlled Server，还有一个独立的 local-only 例外。设置 `WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true` 后，仅当请求由允许的本地 credential 认证时才信任 ChatGPT host-file rewrite：普通 user API token，或 Desktop regular Tunnel 使用的已配置 Server bootstrap credential。该 Tunnel 从本机 `WEBCODEX_TOKEN` 配置派生 credential 并私下完成注入；不要复制或暴露它。非 loopback bind 和其它 credential class 都会忽略该 flag；network-accessible Server 应保持未设置。
 
 用 `POST /api/oauth/clients/list` 与 `POST /api/oauth/clients/revoke` 列出与
 撤销 client。OAuth 使用 authorization-code 流程；动态 client 注册、OIDC 与

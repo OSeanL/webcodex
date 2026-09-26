@@ -28,6 +28,7 @@ export function useDesktopWorkspace() {
   const hasLoadedState = Boolean(state);
   const shouldObserveChatgptActivity = Boolean(
     state?.readiness.runtime_ready
+      && state?.project?.runtime_project_id
       && !hasCurrentOperation
       && !refreshing
       && windowFocused,
@@ -47,6 +48,8 @@ export function useDesktopWorkspace() {
   useEffect(() => {
     mainRef.current?.focus({ preventScroll: true });
     mainRef.current?.scrollTo?.({ top: 0 });
+    // Narrow layouts scroll the window rather than the main pane.
+    if (window.innerWidth <= 600) window.scrollTo(0, 0);
   }, [navigation, showSetup]);
 
   useEffect(() => {
@@ -108,9 +111,9 @@ export function useDesktopWorkspace() {
         if (cancelled) return;
         // Keep first-run setup mounted through intermediate topology snapshots
         // and the optional Tunnel handoff, including their error/retry paths.
-        if (!initial.topology) setShowSetup(true);
+        if (!initial.topology && !initial.configuration_issue) setShowSetup(true);
         commitState(initial);
-        if (initial.current_operation) return;
+        if (initial.current_operation || initial.configuration_issue) return;
         const resumeExisting = Boolean(
           initial.topology
           && initial.runtime_autostart
@@ -228,7 +231,6 @@ export function useDesktopWorkspace() {
       !topology ||
       topology.experience !== "full" ||
       topology.server.kind !== "local" ||
-      !state.project ||
       !state.readiness.runtime_ready
     ) {
       openSetup();

@@ -298,7 +298,7 @@ fn list_project_files_paging_schema_keeps_cardinality_bounded() {
 }
 
 #[test]
-fn sync_validation_and_run_shell_timeout_schema_defers_upper_bounds_to_runtime() {
+fn execution_timeout_schemas_keep_runtime_bounds_and_hide_sync_wait_tuning() {
     let specs = registered_tool_specs();
     for (name, default) in [
         ("cargo_check", 600),
@@ -313,53 +313,36 @@ fn sync_validation_and_run_shell_timeout_schema_defers_upper_bounds_to_runtime()
         assert_eq!(timeout["default"], default, "{name}");
         let desc = timeout["description"].as_str().unwrap_or("");
         assert!(desc.contains("3600") && desc.to_ascii_lowercase().contains("job"));
-
-        let sync_wait = &spec.input_schema["properties"]["sync_wait_secs"];
-        assert_eq!(sync_wait["type"], "integer", "{name}");
-        assert_eq!(sync_wait["minimum"], 1, "{name}");
-        assert!(sync_wait.get("maximum").is_none(), "{name}");
-        assert!(sync_wait.get("default").is_none(), "{name}");
-        let desc = sync_wait["description"].as_str().unwrap_or("");
-        assert!(desc.contains("same execution"), "{name}: {desc}");
         assert!(
-            desc.contains("Runtime early-handoff default"),
-            "{name}: {desc}"
-        );
-        assert!(
-            desc.contains("never extends timeout_secs"),
-            "{name}: {desc}"
+            spec.input_schema["properties"]
+                .get("sync_wait_secs")
+                .is_none(),
+            "{name} must hide sync_wait_secs from model discovery"
         );
     }
+
     let cargo_fmt = spec_named(&specs, "cargo_fmt");
     let timeout = &cargo_fmt.input_schema["properties"]["timeout_secs"];
     assert_eq!(timeout["type"], "integer");
     assert_eq!(timeout["minimum"], 1);
     assert!(timeout.get("maximum").is_none());
     assert_eq!(timeout["default"], 120);
-    let sync_wait = &cargo_fmt.input_schema["properties"]["sync_wait_secs"];
-    assert_eq!(sync_wait["type"], "integer");
-    assert_eq!(sync_wait["minimum"], 1);
-    assert!(sync_wait.get("maximum").is_none());
-    assert!(sync_wait.get("default").is_none());
-    let sync_wait_desc = sync_wait["description"].as_str().unwrap_or("");
-    assert!(
-        sync_wait_desc.contains("Runtime early-handoff default"),
-        "cargo_fmt: {sync_wait_desc}"
-    );
-    for valid in [
-        serde_json::json!({"project": "agent:demo:repo", "check": false, "sync_wait_secs": 1}),
-        serde_json::json!({"project": "agent:demo:repo", "sync_wait_secs": 60}),
+    assert!(cargo_fmt.input_schema["properties"]
+        .get("sync_wait_secs")
+        .is_none());
+
+    for name in [
+        "run_process",
+        "run_script",
+        "run_shell",
+        "run_skill_resource",
     ] {
-        test_support::validate_schema_instance(&valid, &cargo_fmt.input_schema)
-            .unwrap_or_else(|error| panic!("valid ensure-format input rejected: {valid}: {error}"));
-    }
-    for invalid in [
-        serde_json::json!({"project": "agent:demo:repo", "check": false, "sync_wait_secs": 0}),
-        serde_json::json!({"project": "agent:demo:repo", "sync_wait_secs": 0}),
-    ] {
+        let spec = spec_named(&specs, name);
         assert!(
-            test_support::validate_schema_instance(&invalid, &cargo_fmt.input_schema).is_err(),
-            "invalid ensure-format sync_wait_secs passed schema: {invalid}"
+            spec.input_schema["properties"]
+                .get("sync_wait_secs")
+                .is_none(),
+            "{name} must hide sync_wait_secs from model discovery"
         );
     }
 
@@ -372,14 +355,6 @@ fn sync_validation_and_run_shell_timeout_schema_defers_upper_bounds_to_runtime()
     let timeout_desc = timeout["description"].as_str().unwrap_or_default();
     assert!(timeout_desc.contains("shared structured-execution ceiling"));
     assert!(!timeout_desc.contains("120 are accepted and clamped"));
-    let sync_wait = &run_shell.input_schema["properties"]["sync_wait_secs"];
-    assert_eq!(sync_wait["type"], "integer");
-    assert_eq!(sync_wait["minimum"], 1);
-    assert!(sync_wait.get("maximum").is_none());
-    assert!(sync_wait.get("default").is_none());
-    let sync_desc = sync_wait["description"].as_str().unwrap_or_default();
-    assert!(sync_desc.contains("same-execution durable Job handoff"));
-    assert!(sync_desc.contains("not when the command is killed"));
 
     let search = spec_named(&specs, "search_project_texts");
     assert!(
@@ -387,6 +362,22 @@ fn sync_validation_and_run_shell_timeout_schema_defers_upper_bounds_to_runtime()
             .get("maximum")
             .is_none()
     );
+}
+
+#[test]
+fn cargo_check_schema_exposes_bounded_multi_package_selection() {
+    let specs = registered_tool_specs();
+    let schema = &spec_named(&specs, "cargo_check").input_schema;
+    let packages = &schema["properties"]["packages"];
+
+    assert_eq!(packages["type"], "array");
+    assert_eq!(packages["minItems"], 1);
+    assert!(packages["maxItems"].as_u64().is_some());
+    assert_eq!(packages["items"]["minLength"], 1);
+    assert_eq!(packages["items"]["maxLength"], 500);
+    assert!(packages["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("package")));
 }
 
 #[test]
@@ -532,12 +523,20 @@ fn run_script_schema_is_typed_bounded_and_hides_execution_infrastructure() {
     );
     assert_eq!(
         properties["language"]["enum"],
-        json!(["sh", "bash", "powershell", "javascript", "typescript"])
+        json!([
+            "sh",
+            "bash",
+            "powershell",
+            "python",
+            "javascript",
+            "typescript"
+        ])
     );
     let language_description = properties["language"]["description"]
         .as_str()
         .expect("run_script language description");
     for phrase in [
+        "temporary .py file",
         ".mjs ESM",
         ".mts ESM",
         "erasable type stripping",
@@ -617,17 +616,8 @@ fn cargo_fmt_conditional_timeout_schema_matches_contract() {
     assert!(validates(
         &json!({"project": "demo", "check": true, "timeout_secs": 3600})
     ));
-    assert!(validates(
-        &json!({"project": "demo", "check": true, "timeout_secs": 3600, "sync_wait_secs": 1})
-    ));
-    assert!(validates(
-        &json!({"project": "demo", "check": true, "timeout_secs": 3600, "sync_wait_secs": 60})
-    ));
     assert!(!validates(
-        &json!({"project": "demo", "check": true, "timeout_secs": 3600, "sync_wait_secs": 0})
-    ));
-    assert!(validates(
-        &json!({"project": "demo", "check": true, "timeout_secs": 3600, "sync_wait_secs": 61})
+        &json!({"project": "demo", "check": true, "timeout_secs": 3600, "sync_wait_secs": 1})
     ));
     assert!(validates(
         &json!({"project": "demo", "check": true, "timeout_secs": 3601})
@@ -635,17 +625,11 @@ fn cargo_fmt_conditional_timeout_schema_matches_contract() {
     assert!(validates(
         &json!({"project": "demo", "check": false, "timeout_secs": 120})
     ));
-    assert!(validates(
+    assert!(!validates(
         &json!({"project": "demo", "check": false, "timeout_secs": 120, "sync_wait_secs": 1})
     ));
-    assert!(validates(
+    assert!(!validates(
         &json!({"project": "demo", "timeout_secs": 120, "sync_wait_secs": 1})
-    ));
-    assert!(!validates(
-        &json!({"project": "demo", "check": false, "timeout_secs": 120, "sync_wait_secs": 0})
-    ));
-    assert!(!validates(
-        &json!({"project": "demo", "timeout_secs": 120, "sync_wait_secs": 0})
     ));
     assert!(validates(
         &json!({"project": "demo", "check": false, "timeout_secs": 121})
@@ -945,6 +929,7 @@ fn code_mode_exec_schema_keeps_authority_outer_bound_and_source_bounded() {
             "recording_session_id",
             "ack_session_context_revision",
             "ack_session_message_ids",
+            "ack_ref",
             "context_request",
             "session_message_resolution",
         ]
@@ -980,6 +965,7 @@ fn code_mode_effectful_schema_keeps_authority_outer_bound_and_deadline_explicit(
             "recording_session_id",
             "ack_session_context_revision",
             "ack_session_message_ids",
+            "ack_ref",
             "context_request",
             "session_message_resolution",
         ]
@@ -1009,6 +995,7 @@ fn code_mode_mutating_schema_keeps_authority_outer_bound_and_mutation_scope_narr
             "recording_session_id",
             "ack_session_context_revision",
             "ack_session_message_ids",
+            "ack_ref",
             "context_request",
             "session_message_resolution",
             "state_changed",
@@ -1253,4 +1240,23 @@ fn skill_runtime_and_management_schemas_preserve_typed_bounds() {
             "{name}"
         );
     }
+}
+#[test]
+fn process_alias_and_python_are_host_visible_without_opening_objects() {
+    for name in ["run_process", "run_detached_process"] {
+        let schema = input_schema_for_tool(name);
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["argv"]["type"], "array");
+        assert_eq!(
+            schema["properties"]["argv"]["maxItems"],
+            schema["properties"]["args"]["maxItems"]
+        );
+        assert!(schema["properties"].get("arguments").is_none());
+    }
+    let schema = input_schema_for_tool("run_script");
+    let language = schema["properties"]["language"].to_string();
+    assert!(language.contains("python"));
+    assert!(!language.contains("python3"));
+    let shell = input_schema_for_tool("run_shell");
+    assert_eq!(shell["properties"]["login"]["type"], "boolean");
 }

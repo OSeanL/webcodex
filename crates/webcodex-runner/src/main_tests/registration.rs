@@ -46,6 +46,17 @@ fn current_runner_registration_advertises_v2_and_complete_generation_baseline() 
         RUNNER_PROTOCOL_GENERATION_V2
     );
 
+    let browser_available = webcodex_browser::discover_chromium_executable().is_some();
+    assert_eq!(
+        body.capabilities.browser_element_action_admission,
+        browser_available,
+        "current Runner must advertise exact Browser element-action admission iff its Browser backend is available"
+    );
+    assert!(
+        !RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES
+            .contains(&"browser_element_action_admission"),
+        "Browser element-action admission is additive and must remain rolling-upgrade fenced"
+    );
     let capabilities = serde_json::to_value(&body.capabilities).unwrap();
     assert_eq!(
         RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES.len(),
@@ -169,6 +180,7 @@ fn computer_register_request_announces_platform_capabilities_and_generation() {
     assert!(caps.structured_cargo_test_count_assertion);
     assert!(caps.structured_cargo_test_execution_policy);
     assert!(caps.structured_cargo_test_lib);
+    assert!(caps.structured_cargo_check_packages);
     assert!(caps.structured_go_test_json);
     assert!(caps.structured_go_test_tool);
     assert!(caps.structured_go_test_packages);

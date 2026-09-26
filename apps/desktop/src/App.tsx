@@ -1,10 +1,17 @@
+import { useState } from "react";
 import { WorkspaceProvider } from "./features/workspace/WorkspaceContext";
-import brandIcon from "./assets/brand.png";
+import { Alert, Button } from "@mantine/core";
+import { DesktopMantineProvider } from "./components/DesktopMantineProvider";
+import { BrandMark } from "../../../frontend/src/ui/BrandMark";
 import { ExtensionsPanel } from "./features/extensions/ExtensionsPanel";
 import { ComputerPermissions } from "./features/settings/ComputerPermissions";
 import { Sidebar } from "./components/Sidebar";
 import { useDesktopWorkspace } from "./hooks/useDesktopWorkspace";
 import { desktopApi } from "./lib/desktop-api";
+import { useRuntimeUpdates } from "./hooks/useRuntimeUpdates";
+import { UpdateBanner } from "./features/settings/AboutPanel";
+import { ReadinessBanner } from "./features/dashboard/ReadinessBanner";
+import { useShellText } from "./i18n/runtime-shell";
 import type {
   DesktopError,
 } from "./models/topology";
@@ -18,16 +25,24 @@ import { useLocale } from "./i18n/locale";
 import { desktopCommandDiagnostics, desktopErrorPresentation, operationLabel } from "./i18n/presentation";
 
 export default function App() {
+  return <DesktopMantineProvider><DesktopApp /></DesktopMantineProvider>;
+}
+
+function DesktopApp() {
   const { t } = useLocale();
+  const s = useShellText();
+  const [settingsSection, setSettingsSection] = useState<"diagnostics" | "runtime" | undefined>();
   const { state, activity, navigation, setNavigation, refreshing, error, setError, cancelSubmittingId, showSetup, setShowSetup, setStartupAttempt, mainRef, commitState, openSetup, chooseLocalProject, refresh, resumeRuntime, cancelCurrentOperation, runStateOperation } = useDesktopWorkspace();
+  const updates = useRuntimeUpdates(Boolean(state && !state.current_operation && !state.configuration_issue));
+  const openSettings = (section: "diagnostics" | "runtime") => { setSettingsSection(section); setNavigation("settings"); };
   if (!state) {
     return (
       <main className="splash">
-        <img className="brand-mark" src={brandIcon} alt="" />
+        <BrandMark />
         {error ? (
           <section className="startup-error" aria-label="WebCodex">
             <AppError error={error} />
-            <button
+            <Button
               className="primary-button"
               type="button"
               onClick={() => {
@@ -37,7 +52,7 @@ export default function App() {
               data-webcodex-action="retry-desktop-startup"
             >
               {t("common.retry")}
-            </button>
+            </Button>
           </section>
         ) : (
           <span role="status">{t("app.loading")}</span>
@@ -76,7 +91,7 @@ export default function App() {
               <span>{t("operation.cancelNote")}</span>
             </div>
             {state.current_operation.cancellable && (
-              <button
+              <Button
                 className="secondary-button"
                 type="button"
                 disabled={
@@ -89,13 +104,15 @@ export default function App() {
                 {state.current_operation.phase === "cancelling"
                   ? t("operation.cancelling")
                   : t("operation.cancel")}
-              </button>
+              </Button>
             )}
           </section>
         )}
-        {error && <AppError error={error} />}
+        {error && <><AppError error={error} /><div className="shell-actions"><button type="button" className="secondary-button" onClick={() => openSettings("diagnostics")}>{s("Diagnostics")}</button><button type="button" className="text-button" onClick={() => openSettings("runtime")}>{s("Select another Runtime")}</button></div></>}
         {navigation !== "settings" && <ComputerPermissions welcome />}
-        {navigation === "home" && (needsSetup ? (
+        {navigation === "home" && <UpdateBanner updates={updates} />}
+        {navigation === "home" && (state.topology || state.configuration_issue) && <ReadinessBanner state={state} onState={commitState} onDiagnostics={() => openSettings("diagnostics")} onRuntime={() => openSettings("runtime")} onConnection={() => setNavigation("connection")} />}
+        {navigation === "home" && !state.configuration_issue && (needsSetup ? (
           <FirstRun
             state={state}
             onState={commitState}
@@ -109,7 +126,6 @@ export default function App() {
             onRefresh={() => void refresh()}
             onResumeRuntime={() => void resumeRuntime()}
             onChooseProject={() => void chooseLocalProject()}
-            onOpenProject={(path) => void runStateOperation(() => desktopApi.activateLocalProject(path))}
             onChangeSetup={openSetup}
             onNavigate={setNavigation}
             onStopQuickShare={() => void runStateOperation(desktopApi.stopQuickShare)}
@@ -117,12 +133,12 @@ export default function App() {
           />
         ))}
         {navigation === "projects" && (
-          <ProjectsPanel state={state} onChooseProject={() => void chooseLocalProject()} onSelectProject={(path) => void runStateOperation(() => desktopApi.activateLocalProject(path))} />
+          <ProjectsPanel state={state} onState={commitState} onChooseProject={() => void chooseLocalProject()} />
         )}
         {navigation === "connection" && <ConnectionPanel state={state} onState={commitState} />}
         {navigation === "activity" && <ActivityPanel activity={activity} />}
         {navigation === "extensions" && <ExtensionsPanel state={state} onState={commitState} />}
-        {navigation === "settings" && <SettingsPanel state={state} onState={commitState} onChangeSetup={openSetup} onStopRuntime={() => void runStateOperation(desktopApi.stopLocalRuntime)} />}
+        {navigation === "settings" && <SettingsPanel state={state} onState={commitState} onChangeSetup={openSetup} onStopRuntime={() => void runStateOperation(desktopApi.stopLocalRuntime)} initialSection={settingsSection} onActivity={() => setNavigation("activity")} updates={updates} />}
       </main>
     </div></WorkspaceProvider>
   );
@@ -133,7 +149,7 @@ function AppError({ error }: { error: DesktopError }) {
   const presentation = desktopErrorPresentation(error, t);
   const diagnostics = desktopCommandDiagnostics(error);
   return (
-    <div className="error-card app-error" role="alert">
+    <Alert className="error-card app-error" role="alert" variant="light" color="red">
       <strong>{presentation.title}</strong>
       <span>{presentation.action}</span>
       <details>
@@ -150,6 +166,6 @@ function AppError({ error }: { error: DesktopError }) {
           </dl>
         )}
       </details>
-    </div>
+    </Alert>
   );
 }

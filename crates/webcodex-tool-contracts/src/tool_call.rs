@@ -7,8 +7,9 @@
 #[cfg(feature = "workspace-checkpoints")]
 use super::tool_inputs::CheckpointValidationInput;
 use super::tool_inputs::{
-    default_true, ApplyFileChangeInput, CodingGuidanceProfile, ExecutionPurpose, ExecutionShell,
-    GoalLifecycleInput, SessionMode, WorkOnProjectMode,
+    default_true, deserialize_optional_coding_guidance_profile, ApplyFileChangeInput,
+    CodingGuidanceProfile, ExecutionPurpose, ExecutionShell, GoalLifecycleInput, SessionMode,
+    WorkOnProjectMode,
 };
 use crate::{lookup_tool_definition, model_visible_tool_names_csv};
 use schemars::JsonSchema;
@@ -27,7 +28,9 @@ use webcodex_core::plugin::{
     validate_provider_id as validate_plugin_provider_id,
     validate_tool_name as validate_plugin_tool_name, PLUGIN_MAX_ARGUMENT_BYTES,
 };
-use webcodex_core::runner_protocol::ShellScriptLanguage;
+use webcodex_core::runner_protocol::{
+    normalize_cargo_packages, ShellScriptLanguage, CARGO_PACKAGE_MAX_ITEMS, CARGO_VALUE_MAX_BYTES,
+};
 use webcodex_core::runtime_contract::{
     validate_project_op_path, DEFAULT_OBSERVE_JOBS_TAIL_LINES,
     GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES,
@@ -41,6 +44,10 @@ use webcodex_core::workflow_session_contract::{
 pub const TOOL_CALL_TOOL_FIELD: &str = "tool";
 pub const TOOL_CALL_PARAMS_FIELD: &str = "params";
 pub const TOOL_CALL_WRAPPER_FIELDS: &[&str] = &[TOOL_CALL_TOOL_FIELD, TOOL_CALL_PARAMS_FIELD];
+
+/// Compact model-facing form of one exact Agent continuation tuple.
+/// The server stores the mapping. This text is not a credential.
+pub const AGENT_CONTINUATION_REF_PATTERN: &str = "^~ac[1-9][0-9]{0,18}$";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -332,8 +339,10 @@ pub struct SearchProjectTextsQuery {
     #[serde(default)]
     pub result_mode: Option<SearchResultMode>,
     #[schemars(extend("default" = 30))]
-    /// Optional search timeout in seconds. Server clamps the value to 1..120 (default 30). Out-of-range
-    /// values are accepted and clamped rather than rejected by schema.
+    /// Per-query execution ceiling in seconds. Server clamps the value to 1..120 (default 30).
+    /// A search_project_texts batch also shares one Server-owned absolute latency deadline, so the
+    /// effective query timeout is the smaller of this ceiling and the remaining batch budget. Queued
+    /// queries, bounded retries, and diagnostics do not reserve or reset that outer deadline.
     #[serde(default)]
     pub timeout_secs: Option<i64>,
 }
@@ -1419,12 +1428,18 @@ pub enum ToolCall {
         /// title.
         #[schemars(length(min = 1, max = 4000))]
         instruction: String,
-        /// Model guidance only: direct (default) or code_mode for read-only orchestration strategy.
-        /// No tool admission, authority, effects, or Session state changes; explicit resume may choose
-        /// again. code_mode is invalid when Experimental Code Mode is not compiled. Request
+        /// Model guidance only. An explicit direct, host_code_mode, or feature-gated code_mode
+        /// always wins. When omitted on MCP, the configured MCP Host profile supplies the default;
+        /// omission on non-MCP/internal calls falls back to direct. No tool admission, authority,
+        /// effects, or Session state changes; explicit resume may choose again. Request
         /// `context_request=["webcodex.workflow"]` when the current model context needs that guidance.
-        #[serde(default)]
-        guidance_profile: CodingGuidanceProfile,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_optional_coding_guidance_profile",
+            skip_serializing_if = "Option::is_none"
+        )]
+        #[schemars(with = "CodingGuidanceProfile")]
+        guidance_profile: Option<CodingGuidanceProfile>,
         #[schemars(extend("default" = true))]
         /// Whether startup should include a small bounded Skills/Plugins selection catalog. Defaults to
         /// true. Set false only when the caller's current model context already retains the relevant
@@ -1482,22 +1497,42 @@ pub enum ToolCall {
         include_validation_summary: Option<bool>,
     },
 
-    /// Explicitly present the current bounded Work Result for one exact coding Session.
+    /// Explicitly present one persistent card for the current client Window.
+    /// Project authority is re-checked on every refresh; Workflow Session linkage is optional evidence.
     PresentWorkResult {
-        /// Required exact runtime Project input. It is independently resolved and authorized on every call
-        /// and must match the project scoped to session_id.
+        /// Required exact runtime Project input. It is independently resolved and authorized on every call.
         #[schemars(length(min = 1, max = 512))]
         project: String,
-        /// Required exact project-scoped Workflow Session id. Identity is never inferred from
-        /// current/recent Session, Window, transport, or credential context.
+        /// Optional exact project-scoped Workflow Session association for compatibility.
+        /// Omit it when the Window has not created or resumed a Workflow Session.
+        #[serde(default)]
         #[schemars(regex(pattern = "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"))]
-        session_id: String,
+        session_id: Option<String>,
     },
 
-    /// App-only exact read of the same bounded Work Result projection. This
-    /// business session identity is deliberately excluded from generic Session
-    /// recording so an explicit App refresh cannot mutate the observed ledger.
-    WorkResultState { project: String, session_id: String },
+    /// App-only read of the same Window card projection. Optional Session identity
+    /// is association evidence only and is deliberately excluded from generic recording.
+    WorkResultState {
+        project: String,
+        #[serde(default)]
+        #[schemars(regex(pattern = "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"))]
+        session_id: Option<String>,
+    },
+
+    /// Work Result App-only collaboration write. The App fixes the business kind
+    /// to guidance + requires_ack and supplies one bounded replay key so uncertain
+    /// Host delivery can be retried without duplicating the retained message.
+    WorkResultSendMessage {
+        project: String,
+        /// Optional exact work context explicitly linked to the current Window; never the recipient.
+        #[serde(default)]
+        #[schemars(regex(pattern = "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"))]
+        session_id: Option<String>,
+        #[schemars(length(min = 1, max = 8000))]
+        message: String,
+        #[schemars(length(min = 1, max = 128))]
+        delivery_key: String,
+    },
 
     /// Work Result App-only lazy read from one opaque frozen final-changes snapshot.
     /// Business session identity is deliberately excluded from generic Session
@@ -1565,6 +1600,26 @@ pub enum ToolCall {
         limit: Option<usize>,
     },
 
+    /// Record a bounded external claim without creating native execution evidence.
+    RecordExternalObservation {
+        project: String,
+        session_id: String,
+        /// SHA-256 of the adapter's local conversation identity; not an authority token.
+        #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+        adapter_id: String,
+        /// Stable SHA-256 event identity within this adapter and exact Session.
+        #[schemars(length(min = 64, max = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+        event_id: String,
+        /// Tool name only; no command, argument, output or transcript text.
+        #[schemars(length(min = 1, max = 64), regex(pattern = "^[A-Za-z0-9_.:-]+$"))]
+        observed_tool: String,
+        /// External receipt claim only. Omit when no trustworthy execution receipt is available.
+        #[serde(default)]
+        exit_code: Option<i32>,
+    },
+    /// Read external claims separately from native Session/Job evidence.
+    ListExternalObservations { project: String, session_id: String },
+
     /// Post a bounded session-local ledger message for collaboration, progress,
     /// guidance, or design discussion. This is session metadata only.
     PostSessionMessage {
@@ -1593,6 +1648,12 @@ pub enum ToolCall {
         /// context-scoped and never resolves, accepts, executes, or gates work.
         #[serde(default)]
         requires_ack: bool,
+        /// Optional stable sender-scoped replay key. While the keyed message/replay metadata remains
+        /// retained, exact retries with the same canonical payload return the original message and survive
+        /// Server restart; reusing the key with a different retained payload fails closed.
+        #[schemars(length(min = 1, max = 128))]
+        #[serde(default)]
+        delivery_key: Option<String>,
     },
 
     /// Send a bounded collaboration message to another recent ChatGPT/host window owned by the
@@ -1622,6 +1683,12 @@ pub enum ToolCall {
         /// again. ACK never grants authority, resolves the message, or requires a reply.
         #[serde(default)]
         requires_ack: bool,
+        /// Optional stable sender-window-scoped replay key. While the keyed peer message remains
+        /// retained, exact retries return the original message and survive Server restart; reusing the key
+        /// with a different retained payload fails closed.
+        #[schemars(length(min = 1, max = 128))]
+        #[serde(default)]
+        delivery_key: Option<String>,
     },
 
     /// List session-local ledger messages in stable newest-first order.
@@ -1773,6 +1840,15 @@ pub enum ToolCall {
         #[schemars(range(min = 1))]
         #[serde(default)]
         limit: Option<usize>,
+    },
+
+    /// Adapter/API-only exact recovery read. Uses the canonical handoff projection
+    /// without exposing the business Session through generic recorder semantics.
+    SessionHandoffState {
+        /// Required exact runtime Project; must match the authorized Session Project.
+        project: String,
+        /// Required exact business Workflow Session id.
+        session_id: String,
     },
 
     /// Create a bounded last-known-good workspace checkpoint outside the
@@ -1931,12 +2007,10 @@ pub enum ToolCall {
         #[schemars(range(min = 1))]
         #[serde(default)]
         timeout_secs: Option<u64>,
-        /// Optional synchronous grace before durable Job handoff. Omit to use 10 seconds bounded by the
-        /// total timeout. Explicit values must be positive; values above 55 or above the effective timeout
-        /// are accepted and clamped to the smaller bound. It only controls how long the Server waits for
-        /// the already-started execution before exposing that same execution as a Job; it does not extend
-        /// the total runtime timeout or rerun work.
-        #[schemars(range(min = 1))]
+        /// Legacy caller override for same-execution Job handoff grace. The field remains accepted for
+        /// compatibility but is hidden from model discovery; Server transport policy and timeout_secs bound
+        /// the effective wait. It never extends command lifetime or reruns work.
+        #[schemars(skip)]
         #[serde(default)]
         sync_wait_secs: Option<u64>,
         /// Project-relative working directory. Omit, empty string, or '.' for the project root. Named
@@ -2025,8 +2099,9 @@ pub enum ToolCall {
         /// telemetry bodies.
         #[schemars(length(min = 1, max = 65536))]
         instruction: String,
-        /// Optional explicit run-level ACP config overrides. Omission or {} sends zero set_config_option
-        /// calls. Every key/value must be live-advertised and operator-allowed before prompt dispatch.
+        /// Optional explicit run-level ACP config overrides. Omission or {} sends no caller-requested
+        /// set_config_option calls; Runner-owned forced_config policy may still apply its own values.
+        /// Every caller key/value must be live-advertised and operator-allowed before prompt dispatch.
         #[serde(default)]
         config: Option<BTreeMap<String, webcodex_core::coding_agent::CodingAgentConfigValue>>,
         #[schemars(extend("default" = 300))]
@@ -2070,7 +2145,8 @@ pub enum ToolCall {
     RunScript {
         /// Configured project id.
         project: String,
-        /// Required semantic script language. JavaScript uses Runner-resolved Node.js with fixed .mjs ESM
+        /// Required semantic script language: sh, bash, PowerShell, Python, JavaScript, or TypeScript.
+        /// Python uses a Runner-resolved interpreter and a temporary .py file. JavaScript uses Runner-resolved Node.js with fixed .mjs ESM
         /// semantics. TypeScript uses Runner-resolved Node.js native erasable type stripping from a fixed
         /// .mts ESM file and requires Node.js 22.6.0 or newer. The Runner owns any runtime compatibility
         /// flags; callers cannot provide a runtime path or runtime flags. Session default_shell never
@@ -2104,12 +2180,10 @@ pub enum ToolCall {
         #[schemars(range(min = 1))]
         #[serde(default)]
         timeout_secs: Option<u64>,
-        /// Optional synchronous grace before durable Job handoff. Omit to use 10 seconds bounded by the
-        /// total timeout. Explicit values must be positive; values above 55 or above the effective timeout
-        /// are accepted and clamped to the smaller bound. It only controls how long the Server waits for
-        /// the already-started execution before exposing that same execution as a Job; it does not extend
-        /// the total runtime timeout or rerun work.
-        #[schemars(range(min = 1))]
+        /// Legacy caller override for same-execution Job handoff grace. The field remains accepted for
+        /// compatibility but is hidden from model discovery; Server transport policy and timeout_secs bound
+        /// the effective wait. It never extends command lifetime or reruns work.
+        #[schemars(skip)]
         #[serde(default)]
         sync_wait_secs: Option<u64>,
         /// Project-relative working directory. Omit, empty string, or '.' for the project root. Named
@@ -2143,9 +2217,10 @@ pub enum ToolCall {
         #[schemars(range(min = 1))]
         #[serde(default)]
         timeout_secs: Option<u64>,
-        /// same-execution durable Job handoff grace (default 10s), clamped by 55s and timeout; controls
-        /// return, not when the command is killed; named SSH unsupported.
-        #[schemars(range(min = 1))]
+        /// Legacy caller override for same-execution durable Job handoff grace. Hidden from model discovery;
+        /// Server transport policy and timeout_secs bound the effective wait. It controls return only, not
+        /// when the command is killed; named SSH remains unsupported.
+        #[schemars(skip)]
         #[serde(default)]
         sync_wait_secs: Option<u64>,
         /// Working directory contract: without a Session SSH resource, omit, empty string, or '.' selects
@@ -2163,6 +2238,10 @@ pub enum ToolCall {
         /// uses the remote login shell. The response always records the actual selection.
         #[serde(default)]
         shell: Option<ExecutionShell>,
+        /// Bash login mode. `true` requires `shell="bash"` and executes exactly
+        /// `bash -lc <command>` using the Runner-resolved Bash program.
+        #[serde(default)]
+        login: bool,
     },
 
     /// Open one explicit command-oriented persistent shell for this Workflow
@@ -2474,14 +2553,11 @@ pub enum ToolCall {
         #[schemars(range(min = 1))]
         #[serde(default)]
         timeout_secs: Option<u64>,
-        /// Optional synchronous grace in seconds. With check=true it controls only how long the caller
-        /// waits before the same execution is handed off as a Job; omission uses the Runtime early-handoff
-        /// default bounded by the effective timeout_secs. Explicit positive values above 55 or above the
-        /// effective timeout_secs are accepted and clamped to the smaller bound, and it never extends
-        /// timeout_secs or retries the validation. With check=false it is accepted for caller-shape
-        /// compatibility but ignored; ensure-format remains synchronous and timeout_secs remains the full
-        /// precheck-plus-mutation budget.
-        #[schemars(range(min = 1))]
+        /// Legacy caller override for same-execution Job handoff grace. With check=true the field remains
+        /// accepted but is hidden from model discovery; Server transport policy and timeout_secs bound the
+        /// effective wait. With check=false it is accepted for caller-shape compatibility but ignored;
+        /// ensure-format remains synchronous and timeout_secs remains the full precheck-plus-mutation budget.
+        #[schemars(skip)]
         #[serde(default)]
         sync_wait_secs: Option<u64>,
     },
@@ -2510,9 +2586,17 @@ pub enum ToolCall {
         /// Feature list passed to --features.
         #[serde(default)]
         features: Option<String>,
-        /// Package passed to -p.
+        /// Legacy single workspace package passed to `-p`. Mutually exclusive
+        /// with `packages`; internally canonicalized to the same package set.
         #[serde(default)]
         package: Option<String>,
+        /// Workspace packages passed as repeated `-p` selectors in one Cargo
+        /// invocation. Mutually exclusive with `package`; order and duplicates
+        /// are canonicalized because package selection is set-like.
+        #[schemars(length(min = 1, max = CARGO_PACKAGE_MAX_ITEMS))]
+        #[schemars(inner(length(min = 1, max = CARGO_VALUE_MAX_BYTES)))]
+        #[serde(default)]
+        packages: Option<Vec<String>>,
         #[schemars(extend("default" = 600))]
         /// Total validation runtime budget in seconds (minimum 1). Values above 3600 are accepted and
         /// clamped to 3600. Short validation returns immediately; longer validation keeps the same
@@ -2520,12 +2604,10 @@ pub enum ToolCall {
         #[schemars(range(min = 1))]
         #[serde(default)]
         timeout_secs: Option<u64>,
-        /// Optional synchronous grace in seconds. It controls only how long the caller waits before the
-        /// same execution is handed off as a Job. Omission uses the Runtime early-handoff default bounded
-        /// by the effective timeout_secs. Explicit positive values above 55 or above the effective
-        /// timeout_secs are accepted and clamped to the smaller bound. The submitted validation may still
-        /// be queued; this never extends timeout_secs, retries, or starts a second validation.
-        #[schemars(range(min = 1))]
+        /// Legacy caller override for same-execution Job handoff grace. Hidden from model discovery;
+        /// Server transport policy and the effective timeout_secs bound the wait. The submitted validation
+        /// may still be queued; this never extends timeout_secs, retries, or starts a second validation.
+        #[schemars(skip)]
         #[serde(default)]
         sync_wait_secs: Option<u64>,
     },
@@ -2588,12 +2670,10 @@ pub enum ToolCall {
         #[schemars(range(min = 1))]
         #[serde(default)]
         timeout_secs: Option<u64>,
-        /// Optional synchronous grace in seconds. It controls only how long the caller waits before the
-        /// same execution is handed off as a Job. Omission uses the Runtime early-handoff default bounded
-        /// by the effective timeout_secs. Explicit positive values above 55 or above the effective
-        /// timeout_secs are accepted and clamped to the smaller bound. The submitted validation may still
-        /// be queued; this never extends timeout_secs, retries, or starts a second validation.
-        #[schemars(range(min = 1))]
+        /// Legacy caller override for same-execution Job handoff grace. Hidden from model discovery;
+        /// Server transport policy and the effective timeout_secs bound the wait. The submitted validation
+        /// may still be queued; this never extends timeout_secs, retries, or starts a second validation.
+        #[schemars(skip)]
         #[serde(default)]
         sync_wait_secs: Option<u64>,
     },
@@ -2623,12 +2703,10 @@ pub enum ToolCall {
         #[schemars(range(min = 1))]
         #[serde(default)]
         timeout_secs: Option<u64>,
-        /// Optional synchronous grace in seconds. It controls only how long the caller waits before the
-        /// same execution is handed off as a Job. Omission uses the Runtime early-handoff default bounded
-        /// by the effective timeout_secs. Explicit positive values above 55 or above the effective
-        /// timeout_secs are accepted and clamped to the smaller bound. The submitted validation may still
-        /// be queued; this never extends timeout_secs, retries, or starts a second validation.
-        #[schemars(range(min = 1))]
+        /// Legacy caller override for same-execution Job handoff grace. Hidden from model discovery;
+        /// Server transport policy and the effective timeout_secs bound the wait. The submitted validation
+        /// may still be queued; this never extends timeout_secs, retries, or starts a second validation.
+        #[schemars(skip)]
         #[serde(default)]
         sync_wait_secs: Option<u64>,
     },
@@ -2722,12 +2800,10 @@ pub enum ToolCall {
         #[schemars(range(min = 1))]
         #[serde(default)]
         timeout_secs: Option<u64>,
-        /// Optional synchronous grace before durable Job handoff. Omit to use 10 seconds bounded by the
-        /// total timeout. Explicit values must be positive; values above 55 or above the effective timeout
-        /// are accepted and clamped to the smaller bound. It only controls how long the Server waits for
-        /// the already-started execution before exposing that same execution as a Job; it does not extend
-        /// the total runtime timeout or rerun work.
-        #[schemars(range(min = 1))]
+        /// Legacy caller override for same-execution Job handoff grace. The field remains accepted for
+        /// compatibility but is hidden from model discovery; Server transport policy and timeout_secs bound
+        /// the effective wait. It never extends command lifetime or reruns work.
+        #[schemars(skip)]
         #[serde(default)]
         sync_wait_secs: Option<u64>,
         /// Project-relative working directory. Omit, empty string, or '.' for the project root. Skill
@@ -3191,32 +3267,42 @@ pub enum ToolCall {
         /// authority.
         #[schemars(regex(pattern = "^wc_dagent_[A-Za-z0-9_-]{16}$"))]
         assignee_agent_id: String,
-        /// Caller-generated Attempt-start key. Exact retry returns the same attempt_id and attempt_fence,
-        /// even if that Attempt later becomes stale.
+        /// Caller-generated Attempt-start key. Exact retry returns the same attempt_id, attempt_fence,
+        /// and attempt_ref, even if that Attempt later becomes stale.
         #[schemars(length(min = 1, max = 128))]
         idempotency_key: String,
     },
 
     /// Select the concrete Agent Endpoint continuation backend for one exact live Attempt.
     StartAgentTaskEndpointContinuation {
-        /// Canonical durable AgentTask id. It is not a credential or Connector Task id.
+        /// Server-issued ~ta selector for one exact task, attempt, assignee, fence, and generation.
+        /// Not a credential. Omit it when passing the explicit tuple.
+        #[schemars(regex(pattern = "^~ta[1-9][0-9]{0,18}$"))]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_ref: Option<String>,
+        /// Canonical durable AgentTask id. Required with the explicit tuple. Omit it when using attempt_ref.
         #[schemars(regex(pattern = "^wc_agent_task_[A-Za-z0-9_-]{16}$"))]
-        task_id: String,
-        /// Exact durable AgentTaskAttempt id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        /// Exact durable AgentTaskAttempt id. Required with the explicit tuple. Omit it with attempt_ref.
         #[schemars(regex(pattern = "^wc_agent_task_attempt_[A-Za-z0-9_-]{16}$"))]
-        attempt_id: String,
-        /// Explicit current durable Agent assignee. Agent identity does not grant Project or executor
-        /// authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_id: Option<String>,
+        /// Explicit current assignee. Required with the explicit tuple. Agent identity grants no executor
+        /// authority. Omit it when using attempt_ref.
         #[schemars(regex(pattern = "^wc_dagent_[A-Za-z0-9_-]{16}$"))]
-        assignee_agent_id: String,
-        /// Opaque exact-Attempt freshness fence returned by start_agent_task_attempt. It is not a bearer
-        /// credential or idempotency key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        assignee_agent_id: Option<String>,
+        /// Opaque freshness fence from start_agent_task_attempt. Required with the explicit tuple. Not a
+        /// bearer credential. Omit it when using attempt_ref.
         #[schemars(regex(pattern = "^wc_agent_task_fence_[A-Za-z0-9_-]{21}[AQgw]$"))]
-        attempt_fence: String,
-        /// Exact current Attempt-local controller generation. Carrier replacement increments it without
-        /// creating a new Attempt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_fence: Option<String>,
+        /// Exact Attempt-local controller generation. Required with the explicit tuple. Stale generations
+        /// fail closed. Omit it when using attempt_ref.
         #[schemars(range(min = 1))]
-        attempt_controller_generation: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt_controller_generation: Option<i64>,
     },
 
     /// Explicitly dispatch the exact latest fenced AgentTaskAttempt to one durable CodingAgentRun.
@@ -3455,16 +3541,28 @@ pub enum ToolCall {
     },
 
     /// Present one exact Agent/Endpoint continuation controller card. Never infers a target.
+    /// Pass agent_continuation_ref, or the explicit tuple. Do not pass both.
     PresentAgentContinuation {
-        /// Exact durable Agent id; no current/recent Agent fallback is permitted.
+        /// Server-issued ~ac selector for one exact Agent, Endpoint, and generation. Not a credential.
+        /// Omit it when passing the explicit tuple.
+        #[schemars(regex(pattern = "^~ac[1-9][0-9]{0,18}$"))]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_continuation_ref: Option<String>,
+        /// Exact durable Agent id. Required with endpoint_id and expected_controller_generation when
+        /// agent_continuation_ref is omitted. No current or recent Agent fallback.
         #[schemars(regex(pattern = "^wc_dagent_[A-Za-z0-9_-]{16}$"))]
-        agent_id: String,
-        /// Exact current Agent Endpoint id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        /// Exact Agent Endpoint id. Required with the explicit tuple. Omit it when using
+        /// agent_continuation_ref.
         #[schemars(regex(pattern = "^wc_endpoint_[A-Za-z0-9_-]{16}$"))]
-        endpoint_id: String,
-        /// Exact Server-assigned current Endpoint generation. Stale generations fail closed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint_id: Option<String>,
+        /// Exact Server-assigned Endpoint generation. Required with the explicit tuple. Stale
+        /// generations fail closed and the selector never follows a newer generation.
         #[schemars(range(min = 1))]
-        expected_controller_generation: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_controller_generation: Option<i64>,
     },
 
     /// App-only bind of one live Host View to an exact freshly attached Endpoint generation.
@@ -3926,8 +4024,8 @@ pub enum ToolCall {
         /// Optional one shared bounded wait (a maximum), never a minimum sleep or multiplied by item count.
         /// Omission or any item without a token returns an immediate observation/baseline. Values above 100
         /// seconds are clamped to 100. With tokens, wake_on selects early wake behavior; updates never
-        /// extend the deadline. Runtime accepts explicit waits up to 100 seconds, while model-facing
-        /// continuations recommend 55 seconds to stay below common MCP Host deadlines. Use terminal waits
+        /// extend the deadline. Runtime accepts explicit waits up to 100 seconds; MCP transport may clamp
+        /// that wait further using the effective Server-side Host timing profile. Use terminal waits
         /// when further useful progress depends on terminal outcome; otherwise defer observation while
         /// independent work continues.
         #[schemars(range(min = 1))]
@@ -4210,6 +4308,17 @@ pub enum ToolCall {
         #[schemars(length(min = 1, max = 128))]
         #[serde(default)]
         session_id: Option<String>,
+    },
+
+    /// Read bounded, sanitized persisted activity for the current Host Window.
+    /// Window identity is accepted only from the adapter's ToolCallContext.
+    CurrentWindowActivity {
+        /// Maximum returned events, clamped to 1..50 (default 20).
+        #[serde(default)]
+        limit: Option<usize>,
+        /// Include support/diagnostic events in the event list (default false).
+        #[serde(default)]
+        include_nonmeaningful: bool,
     },
 
     /// Return bounded stdout/stderr tails for a job. Defaults to a bounded tail
@@ -4924,8 +5033,8 @@ pub enum ToolCall {
     /// secrets, full env, or stdout/stderr. It returns service metadata,
     /// Project config status, Runner summaries, and Job counts.
     RuntimeStatus {
-        /// When true, return compact runtime observability with service/version, build revision, tool/job
-        /// counts, Runner health summary, and project effective/server status. Defaults to false.
+        /// True selects sparse health, Project/Job counts and protocol/build/source alignment without
+        /// inventories. Canonical/API default is false (full diagnostics); MCP defaults omission to true.
         #[serde(default)]
         compact: bool,
         /// Alias for compact=true. Returns the same compact runtime observability shape. Defaults to false.
@@ -5135,8 +5244,87 @@ fn validate_structured_validation_sync_wait(name: &str, arguments: &Value) -> Re
     Ok(())
 }
 
+fn canonicalize_cargo_check_packages(name: &str, arguments: &mut Value) -> Result<(), String> {
+    if name != "cargo_check" {
+        return Ok(());
+    }
+    let Some(object) = arguments.as_object_mut() else {
+        return Ok(());
+    };
+    let package_present = object.get("package").is_some_and(|value| !value.is_null());
+    let packages_present = object.get("packages").is_some_and(|value| !value.is_null());
+    if package_present && packages_present {
+        return Err(
+            "invalid arguments for tool 'cargo_check': package and packages are mutually exclusive"
+                .to_string(),
+        );
+    }
+
+    let package = object.get("package").and_then(Value::as_str);
+    let packages = match object.get("packages") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+            .map(|values| values.into_iter().map(str::to_string).collect::<Vec<_>>()),
+        Some(Value::Null) | None => None,
+        Some(_) => return Ok(()), // serde reports the canonical type error.
+    };
+    if package_present && package.is_none() || packages_present && packages.is_none() {
+        return Ok(()); // serde reports the canonical item/type error.
+    }
+    let normalized = normalize_cargo_packages(package, packages.as_deref())
+        .map_err(|reason| format!("invalid arguments for tool 'cargo_check': {reason}"))?;
+    object.remove("package");
+    object.remove("packages");
+    if let Some(packages) = normalized {
+        object.insert("packages".to_string(), serde_json::json!(packages));
+    }
+    Ok(())
+}
+
+/// Only explicitly documented, lossless model-input spellings belong here.
+/// Business ToolCall variants and Runner payloads retain `args` alone.
+fn canonicalize_process_argv_alias(name: &str, arguments: &mut Value) -> Result<bool, String> {
+    if !matches!(name, "run_process" | "run_detached_process") {
+        return Ok(false);
+    }
+    let Some(object) = arguments.as_object_mut() else {
+        return Ok(false);
+    };
+    let Some(alias) = object.remove("argv") else {
+        return Ok(false);
+    };
+    if let Some(canonical) = object.get("args") {
+        if canonical != &alias {
+            return Err("ambiguous compatibility alias: args and argv differ".to_string());
+        }
+    } else {
+        object.insert("args".to_string(), alias);
+    }
+    Ok(true)
+}
+
+fn validate_run_shell_login(name: &str, arguments: &Value) -> Result<(), String> {
+    if name == "run_shell"
+        && arguments.get("login").and_then(Value::as_bool) == Some(true)
+        && arguments.get("shell").and_then(Value::as_str) != Some("bash")
+    {
+        return Err("run_shell login=true requires shell=bash".to_string());
+    }
+    Ok(())
+}
+
 impl ToolCall {
     pub fn from_tool_name(name: &str, arguments: Value) -> Result<Self, String> {
+        Self::from_tool_name_with_normalization(name, arguments).map(|(call, _)| call)
+    }
+
+    /// Returns a stable code only when a documented compatibility alias was used.
+    pub fn from_tool_name_with_normalization(
+        name: &str,
+        arguments: Value,
+    ) -> Result<(Self, Option<&'static str>), String> {
         validate_model_facing_assertion_name(name, &arguments)?;
         validate_model_facing_result_expectation(name, &arguments)?;
         if name == "create_project"
@@ -5186,6 +5374,10 @@ impl ToolCall {
             );
         }
         let mut arguments = strip_tool_call_expectation_metadata(arguments);
+        validate_run_shell_login(name, &arguments)?;
+        let normalization =
+            canonicalize_process_argv_alias(name, &mut arguments)?.then_some("argv_to_args");
+        canonicalize_cargo_check_packages(name, &mut arguments)?;
         if name == "tool_manifest" {
             if let Some(object) = arguments.as_object_mut() {
                 if !object.contains_key("include_recommended_flows") {
@@ -5283,7 +5475,7 @@ impl ToolCall {
                 .validate()
                 .map_err(|error| format!("invalid arguments for tool '{}': {}", name, error))?;
         }
-        Ok(call)
+        Ok((call, normalization))
     }
 
     /// Raw command text for shell-like calls. Consumed only by the workspace
@@ -5306,11 +5498,14 @@ impl ToolCall {
             Self::FinishCodingTask { .. } => "finish_coding_task",
             Self::PresentWorkResult { .. } => "present_work_result",
             Self::WorkResultState { .. } => "work_result_state",
+            Self::WorkResultSendMessage { .. } => "work_result_send_message",
             Self::ChangesFileDiff { .. } => "changes_file_diff",
             Self::SessionSummary { .. } => "session_summary",
             Self::UpdateSessionContext { .. } => "update_session_context",
             Self::CloseSession { .. } => "close_session",
             Self::ValidationSummary { .. } => "validation_summary",
+            Self::RecordExternalObservation { .. } => "record_external_observation",
+            Self::ListExternalObservations { .. } => "list_external_observations",
             Self::PostSessionMessage { .. } => "post_session_message",
             Self::PostPeerMessage { .. } => "post_peer_message",
             Self::ListSessionMessages { .. } => "list_session_messages",
@@ -5320,6 +5515,7 @@ impl ToolCall {
             Self::CompleteSessionMessage { .. } => "complete_session_message",
             Self::SessionDiscussionSummary { .. } => "session_discussion_summary",
             Self::SessionHandoffSummary { .. } => "session_handoff_summary",
+            Self::SessionHandoffState { .. } => "session_handoff_state",
             #[cfg(feature = "workspace-checkpoints")]
             Self::WorkspaceCheckpointCreate { .. } => "workspace_checkpoint_create",
             #[cfg(feature = "workspace-checkpoints")]
@@ -5442,6 +5638,7 @@ impl ToolCall {
             Self::ShowChanges { .. } => "show_changes",
             Self::WorkspaceHygieneCheck { .. } => "workspace_hygiene_check",
             Self::ListJobs { .. } => "list_jobs",
+            Self::CurrentWindowActivity { .. } => "current_window_activity",
             Self::JobTail { .. } => "job_tail",
             Self::WriteProjectFile { .. } => "write_project_file",
             Self::SaveProjectArtifact { .. } => "save_project_artifact",
@@ -5485,6 +5682,11 @@ impl ToolCall {
 
     pub fn session_id(&self) -> Option<&str> {
         match self {
+            // External-observation ingress/read carries an exact business Session
+            // that is independently re-authorized by the runtime method. Keep it
+            // out of this generic recorder projection so adapter traffic cannot
+            // become native Session evidence or consume the bounded event tail.
+            Self::RecordExternalObservation { .. } | Self::ListExternalObservations { .. } => None,
             #[cfg(feature = "experimental-code-mode")]
             Self::CodeModeExec { session_id, .. }
             | Self::CodeModeExecEffectful { session_id, .. }
@@ -5554,11 +5756,13 @@ impl ToolCall {
             | Self::WorkspaceCheckpointRestore { session_id, .. }
             | Self::WorkspaceCheckpointDelete { session_id, .. } => session_id.as_deref(),
             Self::SessionHandoffSummary { session_id, .. } => Some(session_id.as_str()),
-            Self::PresentWorkResult { session_id, .. } => Some(session_id.as_str()),
-            // App-only presentation reads intentionally do not expose their business
-            // Session through this generic recorder projection: each re-authorizes
-            // and reads the exact target inside its runtime method.
-            Self::WorkResultState { .. } | Self::ChangesFileDiff { .. } => None,
+            // Window-card presentation/refresh never becomes generic Session recorder
+            // evidence. An optional Session selector is association evidence only.
+            Self::PresentWorkResult { .. }
+            | Self::WorkResultState { .. }
+            | Self::WorkResultSendMessage { .. }
+            | Self::ChangesFileDiff { .. }
+            | Self::SessionHandoffState { .. } => None,
             Self::ImportConversationFilesToProject { session_id, .. } => session_id.as_deref(),
             Self::CallHierarchy { session_id, .. } => session_id.as_deref(),
             Self::WorkOnProject { session_id, .. } => session_id.as_deref(),
@@ -5623,6 +5827,8 @@ impl ToolCall {
 
     pub fn project(&self) -> Option<&str> {
         match self {
+            Self::RecordExternalObservation { project, .. }
+            | Self::ListExternalObservations { project, .. } => Some(project),
             #[cfg(feature = "experimental-code-mode")]
             Self::CodeModeExec { project, .. }
             | Self::CodeModeExecEffectful { project, .. }
@@ -5705,10 +5911,12 @@ impl ToolCall {
             Self::FinishCodingTask { project, .. }
             | Self::PresentWorkResult { project, .. }
             | Self::WorkResultState { project, .. }
+            | Self::WorkResultSendMessage { project, .. }
             | Self::ChangesFileDiff { project, .. } => Some(project.as_str()),
             Self::UpdateSessionContext { project, .. }
             | Self::ValidationSummary { project, .. } => Some(project.as_str()),
             Self::SessionHandoffSummary { project, .. } => project.as_deref(),
+            Self::SessionHandoffState { project, .. } => Some(project.as_str()),
             _ => None,
         }
     }

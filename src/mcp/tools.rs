@@ -21,12 +21,14 @@ use crate::tool_runtime::model_ergonomics_telemetry::{
 };
 use crate::tool_runtime::specialized::SpecializedGovernanceDenial;
 use crate::tool_runtime::tool_definition::{
-    is_adaptive_runtime_direct_tool, runtime_tool_operator_extension_family,
-    ToolOperatorExtensionFamily,
+    is_adaptive_runtime_direct_tool, is_model_visible_tool_name,
+    runtime_tool_operator_extension_family, ToolOperatorExtensionFamily,
 };
 use crate::tool_runtime::{ToolCall, ToolResult, ToolRuntime, ToolSpec};
 use serde::Deserialize;
 use serde_json::{json, Value};
+
+pub(super) const WORK_RESULT_APP_RESULT_META_KEY: &str = "webcodex/workResult";
 
 fn filter_specs_for_oauth(mut specs: Vec<ToolSpec>, auth: Option<&AuthContext>) -> Vec<ToolSpec> {
     let oauth_scope_projection = auth.is_some_and(AuthContext::is_oauth_token);
@@ -210,8 +212,11 @@ fn unwrap_adaptive_runtime_gateway_arguments(
         allowed_wrapper_fields.extend([
             crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD,
             crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
+            crate::tool_runtime::sessions::TOOL_CALL_ACK_REF_FIELD,
             crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
+            crate::tool_runtime::window_collaboration::TOOL_CALL_WINDOW_REPLY_FIELD,
             crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD,
+            crate::tool_runtime::control_sidecar::CONTROL_FIELD,
         ]);
     }
     for (key, value) in outer {
@@ -401,16 +406,20 @@ fn mcp_context_projection_output_schema() -> Value {
     })
 }
 
-fn add_context_projection_to_output_shape(schema: &mut Value, projection_schema: &Value) {
+fn add_wrapper_projection_to_output_shape(
+    schema: &mut Value,
+    field: &str,
+    projection_schema: &Value,
+) {
     if schema.get("type").and_then(Value::as_str) == Some("object") {
         if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-            properties.insert("context_projection".to_string(), projection_schema.clone());
+            properties.insert(field.to_string(), projection_schema.clone());
         }
     }
     for keyword in ["anyOf", "oneOf", "allOf"] {
         if let Some(branches) = schema.get_mut(keyword).and_then(Value::as_array_mut) {
             for branch in branches {
-                add_context_projection_to_output_shape(branch, projection_schema);
+                add_wrapper_projection_to_output_shape(branch, field, projection_schema);
             }
         }
     }
@@ -422,7 +431,7 @@ fn add_stateless_context_projection_output_schema(tool: &mut Value) {
     };
     let projection_schema = mcp_context_projection_output_schema();
     if let Some(output) = output_schema.pointer_mut("/properties/output") {
-        add_context_projection_to_output_shape(output, &projection_schema);
+        add_wrapper_projection_to_output_shape(output, "context_projection", &projection_schema);
     }
     if let Some(conditions) = output_schema.get_mut("allOf").and_then(Value::as_array_mut) {
         for condition in conditions {
@@ -430,7 +439,11 @@ fn add_stateless_context_projection_output_schema(tool: &mut Value) {
                 if let Some(output) =
                     condition.pointer_mut(&format!("/{branch_name}/properties/output"))
                 {
-                    add_context_projection_to_output_shape(output, &projection_schema);
+                    add_wrapper_projection_to_output_shape(
+                        output,
+                        "context_projection",
+                        &projection_schema,
+                    );
                 }
             }
         }
@@ -445,8 +458,165 @@ fn stateless_collaboration_ack_schema() -> Value {
             "type": "string",
             "pattern": "^wc_msg_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
         },
-        "description": "Proves the current model context still retains the listed ACK-required collaboration messages. For Session messages the id must belong to the explicit recording Session; Peer messages may target the current principal-bound ClientWindow without a recorder. Repeat while retained. If later omitted, unresolved Session messages or retained Peer messages may be surfaced again. ACK neither resolves messages nor grants authority or gates execution."
+        "description": "Proves the current model context still retains the listed ACK-required collaboration messages. Session ACK uses the explicit recorder when present, otherwise an authorized same-Window active Session affinity for the resolved Project; Peer and Operator ACK target the current principal-bound ClientWindow. Repeat while retained. The historical field name is shared across all three channels. ACK neither resolves messages nor grants authority or gates execution."
     })
+}
+
+fn stateless_session_ack_ref_schema() -> Value {
+    json!({
+        "type": "string",
+        "maxLength": crate::tool_runtime::sessions::MAX_TOOL_CALL_ACK_REF_CHARS,
+        "description": "Compact request-scoped ACK evidence returned as session_attention.ack_ref for the exact retained Session ACK set represented by that exchange. It acknowledges only that Session set, grants no authority, never resolves messages, and does not apply to Peer ACK."
+    })
+}
+
+fn stateless_session_attention_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Bounded open ACK-required messages from one exact authorized Workflow Session. Window affinity may select this delivery scope only when no explicit recorder was supplied; it never records the main call or supplies business authority.",
+        "properties": {
+            "session_id": {
+                "type": "string",
+                "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
+            },
+            "source": {
+                "type": "string",
+                "enum": ["recording_session", "business_session", "window_affinity"]
+            },
+            "requires_ack": {"type": "boolean"},
+            "ack_ref": {
+                "type": "string",
+                "maxLength": crate::tool_runtime::sessions::MAX_TOOL_CALL_ACK_REF_CHARS,
+                "description": "Exact compact Session ACK set retained across this exchange; echo on a later request while this context is still retained."
+            },
+            "messages": {
+                "type": "array",
+                "maxItems": crate::tool_runtime::SESSION_ATTENTION_MAX_MESSAGES,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "message_id": {"type": "string"},
+                        "kind": {"type": "string"},
+                        "priority": {"type": "string"},
+                        "created_at": {"type": "integer"},
+                        "message": {"type": "string"},
+                        "message_truncated": {"type": "boolean"}
+                    },
+                    "required": ["message_id", "kind", "priority", "created_at", "message", "message_truncated"]
+                }
+            },
+            "omitted_count": {"type": "integer", "minimum": 0},
+            "truncated": {"type": "boolean"},
+            "ack": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "accepted_count": {"type": "integer", "minimum": 0},
+                    "ignored_count": {"type": "integer", "minimum": 0}
+                },
+                "required": ["accepted_count", "ignored_count"]
+            }
+        },
+        "required": ["session_id", "source", "requires_ack", "messages", "omitted_count", "truncated", "ack"]
+    })
+}
+
+fn add_stateless_session_attention_output_schema(tool: &mut Value) {
+    let Some(output_schema) = tool.get_mut("outputSchema") else {
+        return;
+    };
+    let projection = stateless_session_attention_output_schema();
+    if let Some(output) = output_schema.pointer_mut("/properties/output") {
+        add_wrapper_projection_to_output_shape(output, "session_attention", &projection);
+    }
+    if let Some(conditions) = output_schema.get_mut("allOf").and_then(Value::as_array_mut) {
+        for condition in conditions {
+            for branch_name in ["then", "else"] {
+                if let Some(output) =
+                    condition.pointer_mut(&format!("/{branch_name}/properties/output"))
+                {
+                    add_wrapper_projection_to_output_shape(
+                        output,
+                        "session_attention",
+                        &projection,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn stateless_window_reply_supported(tool_name: Option<&str>) -> bool {
+    let Some(tool_name) = tool_name else {
+        return false;
+    };
+    if matches!(
+        tool_name,
+        crate::mcp_gateway::MCP_TOOL_NAME
+            | crate::plugin_gateway::PLUGIN_TOOL_NAME
+            | crate::ssh_resource_gateway::SSH_RESOURCE_TOOL_NAME
+    ) {
+        return false;
+    }
+    tool_name == ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME || is_model_visible_tool_name(tool_name)
+}
+
+fn stateless_window_reply_input_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Reply to one Operator message retained in this exact Window; no Workflow Session required. The reply is persisted independently after the main tool result.",
+        "properties": {
+            "reply_to": {
+                "type": "string",
+                "pattern": "^wc_msg_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$"
+            },
+            "message": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": crate::tool_runtime::window_collaboration::MAX_WINDOW_REPLY_CHARS
+            }
+        },
+        "required": ["reply_to", "message"]
+    })
+}
+
+fn stateless_window_reply_output_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+            "success": {"type": "boolean"},
+            "message_id": {"type": "string"},
+            "reply_to": {"type": "string"},
+            "replayed": {"type": "boolean"},
+            "state_changed": {}
+        },
+        "required": ["success", "state_changed"]
+    })
+}
+
+fn add_stateless_window_reply_output_schema(tool: &mut Value) {
+    let Some(output_schema) = tool.get_mut("outputSchema") else {
+        return;
+    };
+    let projection = stateless_window_reply_output_schema();
+    if let Some(output) = output_schema.pointer_mut("/properties/output") {
+        add_wrapper_projection_to_output_shape(output, "window_reply", &projection);
+    }
+    if let Some(conditions) = output_schema.get_mut("allOf").and_then(Value::as_array_mut) {
+        for condition in conditions {
+            for branch_name in ["then", "else"] {
+                if let Some(output) =
+                    condition.pointer_mut(&format!("/{branch_name}/properties/output"))
+                {
+                    add_wrapper_projection_to_output_shape(output, "window_reply", &projection);
+                }
+            }
+        }
+    }
 }
 
 fn insert_stateless_collaboration_ack_property(properties: &mut serde_json::Map<String, Value>) {
@@ -454,14 +624,22 @@ fn insert_stateless_collaboration_ack_property(properties: &mut serde_json::Map<
         crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD.to_string(),
         stateless_collaboration_ack_schema(),
     );
+    properties.insert(
+        crate::tool_runtime::sessions::TOOL_CALL_ACK_REF_FIELD.to_string(),
+        stateless_session_ack_ref_schema(),
+    );
 }
+
+pub(super) const RECORDING_SESSION_SELECTOR_SCHEMA_PATTERN: &str =
+    "^(~s[1-9][0-9]{0,19}|wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32}))$";
 
 pub(super) fn add_stateless_workflow_recorder_metadata(payload: &mut Value) {
     let Some(tools) = payload.get_mut("tools").and_then(Value::as_array_mut) else {
         return;
     };
     for tool in tools {
-        let tool_name = tool.get("name").and_then(Value::as_str);
+        let tool_name_owned = tool.get("name").and_then(Value::as_str).map(str::to_string);
+        let tool_name = tool_name_owned.as_deref();
         if matches!(
             tool_name,
             Some("goal_plan_sync" | "work_result_state" | "changes_file_diff")
@@ -479,11 +657,17 @@ pub(super) fn add_stateless_workflow_recorder_metadata(payload: &mut Value) {
             crate::tool_runtime::sessions::TOOL_CALL_RECORDING_SESSION_ID_FIELD.to_string(),
             json!({
                 "type": "string",
-                "pattern": "^wc_sess_([A-Za-z0-9_-]{16}|[0-9a-f]{32})$",
-                "description": "Optional explicit Workflow Session used only to record this call and trusted collaboration provenance. Separate from any tool business Session input; grants no authority; removed before concrete parsing."
+                "pattern": RECORDING_SESSION_SELECTOR_SCHEMA_PATTERN,
+                "description": "Optional explicit recorder provenance for one exact Workflow Session; accepts canonical wc_sess_* or issued principal-scoped ~sN. Never execution/business authority. Omission may still allow authorized same-Window attention without recording."
             }),
         );
         insert_stateless_collaboration_ack_property(properties);
+        if stateless_window_reply_supported(tool_name) {
+            properties.insert(
+                crate::tool_runtime::window_collaboration::TOOL_CALL_WINDOW_REPLY_FIELD.to_string(),
+                stateless_window_reply_input_schema(),
+            );
+        }
         properties.insert(
             crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD.to_string(),
             json!({
@@ -519,7 +703,38 @@ pub(super) fn add_stateless_workflow_recorder_metadata(payload: &mut Value) {
                     "description": format!("Request bounded context material after this tool's main effect/observation; keys are open-ended and currently include {}. This sidecar grants no authority and cannot make requested guidance a retroactive precondition of the current effect. Recover missing project or Memory guidance on a read/observation call before any later dependent mutation.", crate::tool_runtime::context_projection::context_material_keys_csv())
                 }),
             );
+        if let Some(name) = tool_name.filter(|name| {
+            *name == "call_runtime_tool"
+                || crate::tool_runtime::control_sidecar::supports_control_sidecars(name)
+        }) {
+            properties.insert(
+                crate::tool_runtime::control_sidecar::CONTROL_FIELD.to_string(),
+                crate::tool_runtime::control_sidecar::input_schema(name),
+            );
+            let projection = crate::tool_runtime::control_sidecar::output_schema();
+            if let Some(output) = tool.pointer_mut("/outputSchema/properties/output") {
+                add_wrapper_projection_to_output_shape(output, "control", &projection);
+            }
+            if let Some(conditions) = tool
+                .pointer_mut("/outputSchema/allOf")
+                .and_then(Value::as_array_mut)
+            {
+                for condition in conditions {
+                    for branch in ["then", "else"] {
+                        if let Some(output) =
+                            condition.pointer_mut(&format!("/{branch}/properties/output"))
+                        {
+                            add_wrapper_projection_to_output_shape(output, "control", &projection);
+                        }
+                    }
+                }
+            }
+        }
         add_stateless_context_projection_output_schema(tool);
+        add_stateless_session_attention_output_schema(tool);
+        if stateless_window_reply_supported(tool_name) {
+            add_stateless_window_reply_output_schema(tool);
+        }
     }
 }
 
@@ -663,6 +878,21 @@ fn attach_app_tool_content_fallback(result: &mut Value) {
         return;
     };
     result["content"] = json!([{ "type": "text", "text": text }]);
+}
+
+fn attach_work_result_app_private_result(result: &mut Value) {
+    let Some(structured) = result.get("structuredContent").cloned() else {
+        return;
+    };
+    let meta = result.as_object_mut().and_then(|result| {
+        result
+            .entry("_meta")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+    });
+    if let Some(meta) = meta {
+        meta.insert(WORK_RESULT_APP_RESULT_META_KEY.to_string(), structured);
+    }
 }
 
 fn safe_continuation_dispatch_observation(value: Option<&Value>) -> &'static str {
@@ -820,8 +1050,37 @@ pub(super) fn project_job_terminal_resume_suggested_call(
     );
 }
 
+fn project_mcp_runtime_status_input_schema(input_schema: &mut Value) {
+    let Some(compact) = input_schema
+        .pointer_mut("/properties/compact")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    compact.insert("default".to_string(), json!(true));
+    compact.insert(
+        "description".to_string(),
+        json!("MCP defaults to sparse status. Set false for full diagnostics; summary_only=true still selects sparse."),
+    );
+}
+
+fn project_mcp_runtime_status_manifest_defaults(result: &mut ToolResult) {
+    if !result.success || result.output["name"].as_str() != Some("runtime_status") {
+        return;
+    }
+    if let Some(input_schema) = result.output.get_mut("input_schema") {
+        project_mcp_runtime_status_input_schema(input_schema);
+    }
+}
+
 fn mcp_tool_spec_json(mut spec: ToolSpec, compact: bool, app_enabled: bool) -> Value {
     let tool_name = spec.name.clone();
+    if tool_name == "runtime_status" {
+        project_mcp_runtime_status_input_schema(&mut spec.input_schema);
+        spec.description
+            .push_str(" MCP defaults to sparse status; compact=false opts into full diagnostics.");
+    }
+
     if matches!(tool_name.as_str(), "computer_observe" | "browser_observe") {
         adapt_native_image_output_schema_for_mcp(&mut spec);
     }
@@ -997,7 +1256,9 @@ pub(super) async fn handle_list(
 pub(super) enum HostFileImportTrustReason {
     Trusted,
     TrustedLoopbackApiToken,
+    TrustedLoopbackBootstrap,
     LoopbackApiTokenTrustRequiresLoopback,
+    LoopbackBootstrapTrustRequiresLoopback,
     MissingConfig,
     MissingDatabase,
     MissingAuth,
@@ -1014,8 +1275,12 @@ impl HostFileImportTrustReason {
         match self {
             Self::Trusted => "trusted",
             Self::TrustedLoopbackApiToken => "trusted_loopback_api_token",
+            Self::TrustedLoopbackBootstrap => "trusted_loopback_bootstrap",
             Self::LoopbackApiTokenTrustRequiresLoopback => {
                 "loopback_api_token_trust_requires_loopback"
+            }
+            Self::LoopbackBootstrapTrustRequiresLoopback => {
+                "loopback_bootstrap_trust_requires_loopback"
             }
             Self::MissingConfig => "missing_config",
             Self::MissingDatabase => "missing_database",
@@ -1103,21 +1368,41 @@ pub(super) fn mcp_host_file_import_trust_decision_from_state(
     let Some(auth) = auth else {
         return base;
     };
-    if auth.kind == crate::auth::AuthKind::ApiToken
-        && auth.token_kind.as_deref() == Some("user")
-        && config.oauth2.trust_loopback_api_token_mcp_file_import
-    {
-        if config.is_loopback_bound() {
+    if config.oauth2.trust_loopback_api_token_mcp_file_import {
+        let loopback_reasons = if auth.kind == crate::auth::AuthKind::ApiToken
+            && auth.token_kind.as_deref() == Some("user")
+        {
+            Some((
+                HostFileImportTrustReason::TrustedLoopbackApiToken,
+                HostFileImportTrustReason::LoopbackApiTokenTrustRequiresLoopback,
+            ))
+        } else if auth.kind == crate::auth::AuthKind::Bootstrap
+            && auth.is_bootstrap()
+            && config
+                .token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty())
+        {
+            Some((
+                HostFileImportTrustReason::TrustedLoopbackBootstrap,
+                HostFileImportTrustReason::LoopbackBootstrapTrustRequiresLoopback,
+            ))
+        } else {
+            None
+        };
+        if let Some((trusted_reason, non_loopback_reason)) = loopback_reasons {
+            if config.is_loopback_bound() {
+                return HostFileImportTrustDecision {
+                    trust: HostFileImportTrust::TrustedMcpHostFile,
+                    reason: trusted_reason,
+                    ..base
+                };
+            }
             return HostFileImportTrustDecision {
-                trust: HostFileImportTrust::TrustedMcpHostFile,
-                reason: HostFileImportTrustReason::TrustedLoopbackApiToken,
+                reason: non_loopback_reason,
                 ..base
             };
         }
-        return HostFileImportTrustDecision {
-            reason: HostFileImportTrustReason::LoopbackApiTokenTrustRequiresLoopback,
-            ..base
-        };
     }
     if !auth.is_oauth_token() {
         return HostFileImportTrustDecision {
@@ -1299,6 +1584,15 @@ pub(super) fn strip_recording_session_id(arguments: &mut Value) -> Result<Option
     }
 }
 
+fn canonicalize_recording_session_id(
+    runtime: &crate::tool_runtime::ToolRuntime,
+    raw: Option<String>,
+    auth: Option<&crate::auth::AuthContext>,
+) -> Result<Option<String>, String> {
+    raw.map(|raw| runtime.canonicalize_explicit_session_selector(&raw, auth))
+        .transpose()
+}
+
 pub(super) fn strip_stateless_ack_session_message_ids(
     arguments: &mut Value,
 ) -> Result<Vec<String>, String> {
@@ -1344,6 +1638,31 @@ pub(super) fn strip_stateless_ack_session_message_ids(
         }
     }
     Ok(normalized)
+}
+
+pub(super) fn strip_stateless_ack_ref(arguments: &mut Value) -> Result<Option<String>, String> {
+    let Some(object) = arguments.as_object_mut() else {
+        return Ok(None);
+    };
+    match object.remove(crate::tool_runtime::sessions::TOOL_CALL_ACK_REF_FIELD) {
+        None => Ok(None),
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if value.is_empty()
+                || value.len() > crate::tool_runtime::sessions::MAX_TOOL_CALL_ACK_REF_CHARS
+            {
+                return Err(format!(
+                    "field '{}' must be a non-empty bounded string",
+                    crate::tool_runtime::sessions::TOOL_CALL_ACK_REF_FIELD
+                ));
+            }
+            Ok(Some(value.to_string()))
+        }
+        Some(_) => Err(format!(
+            "field '{}' must be a non-empty bounded string",
+            crate::tool_runtime::sessions::TOOL_CALL_ACK_REF_FIELD
+        )),
+    }
 }
 
 pub(super) fn strip_stateless_session_message_resolution(
@@ -1396,6 +1715,51 @@ pub(super) fn strip_stateless_session_message_resolution(
         crate::tool_runtime::sessions::ToolCallSessionMessageResolution {
             message_id,
             resolution,
+        },
+    ))
+}
+
+pub(super) fn strip_stateless_window_reply(
+    arguments: &mut Value,
+) -> Result<Option<crate::tool_runtime::window_collaboration::ToolCallWindowReply>, String> {
+    let Some(object) = arguments.as_object_mut() else {
+        return Ok(None);
+    };
+    let Some(value) =
+        object.remove(crate::tool_runtime::window_collaboration::TOOL_CALL_WINDOW_REPLY_FIELD)
+    else {
+        return Ok(None);
+    };
+    let Value::Object(mut fields) = value else {
+        return Err("field 'window_reply' must be an object with reply_to and message".to_string());
+    };
+    if fields.len() != 2 || !fields.contains_key("reply_to") || !fields.contains_key("message") {
+        return Err("field 'window_reply' accepts exactly reply_to and message".to_string());
+    }
+    let Some(Value::String(reply_to)) = fields.remove("reply_to") else {
+        return Err("window_reply.reply_to must be a wc_msg_* string".to_string());
+    };
+    let reply_to = reply_to.trim().to_string();
+    if !webcodex_core::workflow_session_contract::is_valid_session_message_id(&reply_to) {
+        return Err("window_reply.reply_to must be a valid wc_msg_* id".to_string());
+    }
+    let Some(Value::String(message)) = fields.remove("message") else {
+        return Err("window_reply.message must be a string".to_string());
+    };
+    let message = message.trim().to_string();
+    if message.is_empty() {
+        return Err("window_reply.message must not be empty".to_string());
+    }
+    if message.chars().count() > crate::tool_runtime::window_collaboration::MAX_WINDOW_REPLY_CHARS {
+        return Err(format!(
+            "window_reply.message exceeds {} chars",
+            crate::tool_runtime::window_collaboration::MAX_WINDOW_REPLY_CHARS
+        ));
+    }
+    Ok(Some(
+        crate::tool_runtime::window_collaboration::ToolCallWindowReply {
+            reply_to_message_id: reply_to,
+            message,
         },
     ))
 }
@@ -1568,6 +1932,68 @@ pub(super) async fn handle_call(
     } else {
         Vec::new()
     };
+    let ack_ref = if stateless_2026 {
+        match strip_stateless_ack_ref(&mut params.arguments) {
+            Ok(ack_ref) => ack_ref,
+            Err(message) => {
+                if let Some(lc) = lifecycle.as_deref() {
+                    lc.dispatch_failed("invalid_arguments");
+                    lc.dispatch_finished(false, Some(false), "invalid_arguments");
+                }
+                return McpOutcome::BadRequest(rpc_error(id, -32602, message));
+            }
+        }
+    } else {
+        None
+    };
+    let window_reply = if stateless_2026 {
+        match strip_stateless_window_reply(&mut params.arguments) {
+            Ok(reply) => reply,
+            Err(message) => {
+                if let Some(lc) = lifecycle.as_deref() {
+                    lc.dispatch_failed("invalid_arguments");
+                    lc.dispatch_finished(false, Some(false), "invalid_arguments");
+                }
+                return McpOutcome::BadRequest(rpc_error(id, -32602, message));
+            }
+        }
+    } else {
+        None
+    };
+    if window_reply.is_some()
+        && matches!(
+            params.name.as_str(),
+            crate::mcp_gateway::MCP_TOOL_NAME
+                | crate::plugin_gateway::PLUGIN_TOOL_NAME
+                | crate::ssh_resource_gateway::SSH_RESOURCE_TOOL_NAME
+        )
+    {
+        if let Some(lc) = lifecycle.as_deref() {
+            lc.dispatch_failed("invalid_arguments");
+            lc.dispatch_finished(false, Some(false), "invalid_arguments");
+        }
+        return McpOutcome::BadRequest(rpc_error(
+            id,
+            -32602,
+            "window_reply is supported only on ordinary model-visible Runtime tools",
+        ));
+    }
+    // Strip private control payloads before tracing, canonical argument parsing,
+    // specialized dispatch, and audit. Legacy/hidden adapters reject explicitly.
+    let control = match crate::tool_runtime::control_sidecar::strip_control_sidecars(
+        &mut params.arguments,
+        &params.name,
+        stateless_2026,
+    ) {
+        Ok(value) => value,
+        Err(message) => {
+            if let Some(lc) = lifecycle.as_deref() {
+                lc.dispatch_failed("invalid_arguments");
+                lc.dispatch_finished(false, Some(false), "invalid_arguments");
+            }
+            return McpOutcome::BadRequest(rpc_error(id, -32602, message));
+        }
+    };
     if let Some(lc) = lifecycle.as_deref() {
         lc.capture_payload_lazy("raw_arguments", || {
             if params.name == crate::plugin_gateway::PLUGIN_TOOL_NAME {
@@ -1642,6 +2068,17 @@ pub(super) async fn handle_call(
         let ToolCall::PluginTool(plugin) = call else {
             unreachable!("plugin_tool parser must yield ToolCall::PluginTool");
         };
+        let recording_session_id =
+            match canonicalize_recording_session_id(runtime, recording_session_id, auth) {
+                Ok(session_id) => session_id,
+                Err(message) => {
+                    if let Some(lc) = lifecycle.as_deref() {
+                        lc.dispatch_failed("invalid_arguments");
+                        lc.dispatch_finished(false, Some(false), "invalid_arguments");
+                    }
+                    return McpOutcome::BadRequest(rpc_error(id, -32602, message));
+                }
+            };
         if let Some(lc) = lifecycle.as_deref() {
             lc.capture_payload_lazy("effective_arguments", || {
                 crate::plugin_gateway::audit_arguments(&params.arguments)
@@ -1749,6 +2186,18 @@ pub(super) async fn handle_call(
                 return McpOutcome::BadRequest(rpc_error(id, -32602, message));
             }
         };
+        // Resolve once so a valid short recorder can drive the same best-effort
+        // fallback Project projection as its canonical id. Defer ref errors until
+        // business parsing succeeds to preserve the existing fallback precedence.
+        let canonical_recording_session_id =
+            canonicalize_recording_session_id(runtime, recording_session_id.clone(), auth);
+        let recorder_project = || {
+            canonical_recording_session_id
+                .as_ref()
+                .ok()
+                .and_then(|session_id| session_id.as_deref())
+                .and_then(|session_id| runtime.sessions.session_project(session_id).flatten())
+        };
         let policy = match crate::ssh_resource_gateway::operation_policy(&params.arguments) {
             Ok(policy) => policy,
             Err(_) => {
@@ -1759,9 +2208,7 @@ pub(super) async fn handle_call(
                 }
                 let mut result =
                     crate::ssh_resource_gateway::call(runtime, params.arguments, auth).await;
-                let project = recording_session_id
-                    .as_deref()
-                    .and_then(|session_id| runtime.sessions.session_project(session_id).flatten());
+                let project = recorder_project();
                 runtime.add_peer_collaboration_to_mcp_call_result(
                     &mut result,
                     auth,
@@ -1795,9 +2242,7 @@ pub(super) async fn handle_call(
                 }
                 let mut result =
                     crate::ssh_resource_gateway::call(runtime, params.arguments, auth).await;
-                let project = recording_session_id
-                    .as_deref()
-                    .and_then(|session_id| runtime.sessions.session_project(session_id).flatten());
+                let project = recorder_project();
                 runtime.add_peer_collaboration_to_mcp_call_result(
                     &mut result,
                     auth,
@@ -1817,6 +2262,16 @@ pub(super) async fn handle_call(
                         result
                     },
                 ));
+            }
+        };
+        let recording_session_id = match canonical_recording_session_id {
+            Ok(session_id) => session_id,
+            Err(message) => {
+                if let Some(lc) = lifecycle.as_deref() {
+                    lc.dispatch_failed("invalid_arguments");
+                    lc.dispatch_finished(false, Some(false), "invalid_arguments");
+                }
+                return McpOutcome::BadRequest(rpc_error(id, -32602, message));
             }
         };
         let invocation = match crate::ssh_resource_gateway::invoke(
@@ -1923,6 +2378,8 @@ pub(super) async fn handle_call(
     let job_terminal_continuation_app_admitted = server_mcp_apps_enabled && stateless_2026;
     let app_only_goal_plan_sync = goal_plan_app_admitted && params.name == "goal_plan_sync";
     let app_only_work_result_state = work_result_app_admitted && params.name == "work_result_state";
+    let app_only_work_result_send_message =
+        work_result_app_admitted && params.name == "work_result_send_message";
     let app_only_changes_file_diff = work_result_app_admitted && params.name == "changes_file_diff";
     let app_only_agent_continuation =
         agent_continuation_app_admitted && is_agent_continuation_app_tool_name(&params.name);
@@ -1934,6 +2391,7 @@ pub(super) async fn handle_call(
             .any(|spec| spec.name == params.name);
     let direct_denied = !app_only_goal_plan_sync
         && !app_only_work_result_state
+        && !app_only_work_result_send_message
         && !app_only_changes_file_diff
         && !app_only_agent_continuation
         && !app_only_job_terminal_continuation
@@ -1958,7 +2416,18 @@ pub(super) async fn handle_call(
     // tool identity. A few MCP-only validations still happen before the
     // shared ToolRuntime kernel; preserve those failed attempts in generic
     // telemetry without creating a second record for normal kernel calls.
-    let mut pre_kernel_model_ergonomics = ModelErgonomicsTimer::start(&params.name);
+    // MCP model calls default to sparse status, including the generic gateway.
+    // Preserve omission versus explicit false before canonical bool parsing.
+    if params.name == "runtime_status" {
+        if params.arguments.is_null() {
+            params.arguments = json!({});
+        }
+        if let Some(arguments) = params.arguments.as_object_mut() {
+            arguments.entry("compact").or_insert(json!(true));
+        }
+    }
+    let mut pre_kernel_model_ergonomics =
+        ModelErgonomicsTimer::start_with_arguments(&params.name, &params.arguments);
     let artifact_presentation =
         resources::project_artifact_presentation_mode(&params.name, &params.arguments);
     let resource_tool_call = match resources::prepare_tool_call(
@@ -2011,9 +2480,30 @@ pub(super) async fn handle_call(
     // recording_session_id before the kernel sees any of these calls.
     if matches!(
         params.name.as_str(),
-        "goal_plan_sync" | "work_result_state" | "changes_file_diff"
+        "goal_plan_sync" | "work_result_state" | "work_result_send_message" | "changes_file_diff"
     ) {
         session_id = None;
+    } else {
+        session_id = match canonicalize_recording_session_id(runtime, session_id, auth) {
+            Ok(session_id) => session_id,
+            Err(message) => {
+                if let Some(lc) = lifecycle.as_deref() {
+                    lc.dispatch_failed("invalid_arguments");
+                    lc.dispatch_finished(false, Some(false), "invalid_arguments");
+                }
+                if let (Some(slot), Some(timer)) = (
+                    model_ergonomics_out.as_deref_mut(),
+                    pre_kernel_model_ergonomics.take(),
+                ) {
+                    *slot = Some(
+                        timer
+                            .finish()
+                            .record_for_pre_result_failure("invalid_arguments"),
+                    );
+                }
+                return McpOutcome::BadRequest(rpc_error(id, -32602, message));
+            }
+        };
     }
     let session_message_resolution = if stateless_2026 {
         match strip_stateless_session_message_resolution(&mut params.arguments) {
@@ -2102,11 +2592,15 @@ pub(super) async fn handle_call(
                 host_file_import_trust,
             },
             ToolInvocationMetadata {
+                control,
                 ack_session_message_ids,
+                ack_ref,
                 session_message_resolution,
+                window_reply,
                 context_request,
             },
             ToolProtocolCapabilities {
+                control_sidecars: stateless_2026,
                 context_sidecar: context_sidecar_capable,
                 skill_runtime: skill_runtime_capable,
                 skill_management: skill_management_capable,
@@ -2157,6 +2651,9 @@ pub(super) async fn handle_call(
             .expect("tool kernel outcome without error must include result"),
     };
     debug_assert_eq!(outcome.success, result.success);
+    if params.name == "tool_manifest" {
+        project_mcp_runtime_status_manifest_defaults(&mut result);
+    }
     project_job_terminal_resume_suggested_call(
         app_enabled
             && job_terminal_continuation_app_admitted
@@ -2195,7 +2692,12 @@ pub(super) async fn handle_call(
             mcp_runtime_tool_result_fallback(result, result_presentation)
         }
     };
-    if app_only_agent_continuation || app_only_job_terminal_continuation {
+    if app_only_work_result_state
+        || app_only_work_result_send_message
+        || app_only_changes_file_diff
+        || app_only_agent_continuation
+        || app_only_job_terminal_continuation
+    {
         // ChatGPT production has been observed to complete View-originated
         // tools/call server-side while not forwarding structuredContent back to
         // the View. Keep structuredContent canonical, but duplicate this bounded
@@ -2203,6 +2705,12 @@ pub(super) async fn handle_call(
         // These tools are ModelHidden/app-visible only, so ordinary model tool
         // results retain the compact text fallback.
         attach_app_tool_content_fallback(&mut result);
+    }
+    if app_enabled && params.name == "present_work_result" {
+        // Initial model-originated presentation keeps normal model content compact.
+        // The private MCP App result channel lets the mounted View recover the exact
+        // bounded Work Result when a Host omits structuredContent from tool-result.
+        attach_work_result_app_private_result(&mut result);
     }
     if app_only_agent_continuation {
         log_agent_continuation_app_result(

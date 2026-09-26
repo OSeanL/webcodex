@@ -67,7 +67,7 @@ use webcodex_runner::{
 use webcodex_runner::{
     client_profile_runner_config, configured_validation_job_command, default_config_path,
     dispatch_request_with_outcome, err_cmd, handle_apply_patch_file_request,
-    handle_apply_text_edits_file_request, handle_artifact_file_operation,
+    handle_apply_text_edits_file_request, handle_artifact_file_operation_with_store,
     handle_basic_file_request, handle_write_project_file_request, hostname, load_config,
     max_concurrent_jobs, ok_cmd, project_registry_dir, resolve_requested_path, run_runner,
     validate_client_profile, validate_structured_edit_runner_path, CommandResult, HotRunnerConfig,
@@ -160,6 +160,13 @@ where
         .collect();
     if args.len() == 1 {
         match args[0].as_str() {
+            "--build-info-json" => {
+                return Ok(RunnerCliAction::Exit {
+                    code: 0,
+                    stdout: build_info::build_info_json("webcodex-runner"),
+                    stderr: String::new(),
+                });
+            }
             "--help" | "-h" => {
                 return Ok(RunnerCliAction::Exit {
                     code: 0,
@@ -1405,6 +1412,7 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     // This binary accepts a structured local sh/bash selector on raw shell
     // requests. Older Runners omit the bit so current Servers fail closed.
     capabilities.explicit_shell_selection = true;
+    capabilities.bash_login_shell = true;
     capabilities.jobs = true;
     capabilities.file_read = true;
     capabilities.file_write = true;
@@ -1427,6 +1435,8 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     // Line scopes are an additive rolling-upgrade fence: advertise only because
     // this binary resolves full-match containment before any mutation.
     capabilities.apply_text_edit_line_scope = true;
+    // This binary proves explicit all-match cardinality before any file write.
+    capabilities.apply_text_edit_expected_match_count = true;
     // Codex Patch is an additive request kind with Runner-authoritative parsing and
     // transaction semantics. Older Runners omit it and must fail closed.
     capabilities.apply_patch = true;
@@ -1460,6 +1470,9 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     // `--lib` expands the older structured Cargo test argv vocabulary, so
     // advertise it separately for mixed Server/Runner rolling upgrades.
     capabilities.structured_cargo_test_lib = true;
+    // Repeated `-p` selectors expand the older single-package Cargo check argv
+    // vocabulary, so advertise this independently for rolling upgrades.
+    capabilities.structured_cargo_check_packages = true;
     // This binary accepts both legacy Go validation argv from old Servers and
     // the current machine-readable JSON argv. Do not trust static config or
     // infer this from generic structured validation support.
@@ -1482,6 +1495,7 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     // JavaScript. This bit means the binary understands the semantic protocol;
     // local Node availability/version is resolved only when execution starts.
     capabilities.structured_script_typescript = true;
+    capabilities.structured_script_python = true;
     capabilities.internal_posix_script = true;
     capabilities.structured_execution_jobs = true;
     // Detached process ownership is an independent additive authority. Until
@@ -1525,6 +1539,10 @@ fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabilities {
     let browser_available = webcodex_browser::discover_chromium_executable().is_some();
     capabilities.browser_observe = browser_available;
     capabilities.browser_control = browser_available;
+    // This binary publishes exact snapshot node `actions` and enforces the same
+    // admission set before element effects. Keep it separate from generic Browser
+    // control so a new Server cannot dispatch the stricter contract to an older Runner.
+    capabilities.browser_element_action_admission = browser_available;
     capabilities.browser_launch = browser_available;
     // Native read-only desktop observation is implemented only on macOS and
     // Windows. Unsupported platforms advertise false and fail closed.
@@ -1852,7 +1870,16 @@ fn is_file_request_kind(kind: &str) -> bool {
         || is_artifact_request_kind(kind)
 }
 
+#[cfg(test)]
 fn handle_file_operation(policy: &RunnerPolicy, operation: &RunnerFileOperation) -> CommandResult {
+    handle_file_operation_with_artifact_store(policy, operation, None)
+}
+
+fn handle_file_operation_with_artifact_store(
+    policy: &RunnerPolicy,
+    operation: &RunnerFileOperation,
+    artifact_store_root: Option<&Path>,
+) -> CommandResult {
     let request = operation.payload();
     let path = request.path.as_str();
     let start = Instant::now();
@@ -1901,9 +1928,12 @@ fn handle_file_operation(policy: &RunnerPolicy, operation: &RunnerFileOperation)
         | RunnerFileOperation::ArtifactUploadBegin(_)
         | RunnerFileOperation::ArtifactUploadChunk(_)
         | RunnerFileOperation::ArtifactUploadFinish(_)
-        | RunnerFileOperation::ArtifactUploadAbort(_) => {
-            handle_artifact_file_operation(operation, &resolved, start)
-        }
+        | RunnerFileOperation::ArtifactUploadAbort(_) => handle_artifact_file_operation_with_store(
+            operation,
+            &resolved,
+            start,
+            artifact_store_root,
+        ),
         #[cfg(feature = "workspace-checkpoints")]
         RunnerFileOperation::CheckpointCreate(_) | RunnerFileOperation::CheckpointRestore(_) => {
             handle_checkpoint_file_request(operation, &resolved, start)

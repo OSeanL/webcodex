@@ -26,8 +26,22 @@ pub enum StartupDetail {
 pub enum CodingGuidanceProfile {
     #[default]
     Direct,
+    HostCodeMode,
     #[cfg(feature = "experimental-code-mode")]
     CodeMode,
+}
+
+/// Preserve omission for transport-aware effective guidance selection while
+/// rejecting explicit JSON null, which is not a valid profile request.
+pub fn deserialize_optional_coding_guidance_profile<'de, D>(
+    deserializer: D,
+) -> Result<Option<CodingGuidanceProfile>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<CodingGuidanceProfile>::deserialize(deserializer)?
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("guidance_profile must not be null"))
 }
 
 impl StartupDetail {
@@ -97,8 +111,8 @@ pub use webcodex_core::apply_edits_shared::{
     ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind, ApplyTextLineScope,
 };
 
-/// Canonical file change. For occurrence, line_scope, or multiple edits use kind=edit
-/// with edits[]; occurrence and line_scope belong inside each edit, never on the change.
+/// Canonical file change. For occurrence, line_scope, expected_match_count, or
+/// multiple edits use kind=edit with edits[]; selectors belong inside each edit.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ApplyFileChangeCanonicalInput {
@@ -178,6 +192,7 @@ impl<'de> Deserialize<'de> for ApplyFileChangeInput {
                     new_text: Some(input.new_text),
                     anchor_text: None,
                     occurrence: None,
+                    expected_match_count: None,
                     line_scope: None,
                 }],
                 expected_read_revision: input.expected_read_revision,

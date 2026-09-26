@@ -68,7 +68,7 @@ impl AppState {
                     "Restart the Runner using its actual process owner.",
                 ));
             }
-            let identity = identity_from_config(&core.config)
+            let identity = runner_identity_from_config(&core.config)
                 .ok_or_else(|| desktop_state_unavailable("Runner identity unavailable"))?;
             let runtime = core
                 .config
@@ -92,6 +92,7 @@ impl AppState {
             core.spawn_owned(ProcessKey::LocalRunner, command, false, &cancellation)
                 .await?;
             core.mcp_applied_revision = Some(core.mcp_providers.revision());
+            core.coding_agents_applied_revision = Some(core.coding_agents.revision());
             core.wait_for_runner(
                 &identity,
                 &cancellation,

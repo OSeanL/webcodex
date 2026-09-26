@@ -8,7 +8,7 @@ export interface WorkflowSession {
   project_id?: string; project_name?: string; running_call: boolean;
   running_jobs: number; running_jobs_complete: boolean;
   current_activity?: SessionActivity; last_activity?: SessionActivity;
-  overview: { attention: Attention; reported_progress?: { text: string; reported_at: number } };
+  overview: { attention: Attention; reported_progress?: { text: string; reported_at: number }; validation?: { state: string; unresolved_failure_count?: number; history_complete?: boolean } };
   activity?: SessionActivity[]; activity_truncated?: boolean;
 }
 export interface WorkspaceProject {
@@ -16,6 +16,7 @@ export interface WorkspaceProject {
   sessions?: { active_sessions: number; running_sessions: number; latest_updated_at?: number; sessions_truncated?: boolean };
 }
 export interface RunnerOverview {
+  projects_available?: boolean;
   client_id: string; connected: boolean; status?: string; visible_project_count: number;
   projects: WorkspaceProject[]; projects_truncated: boolean;
   recent_sessions?: { sessions: WorkflowSession[]; truncated: boolean; scan_truncated: boolean };
@@ -25,8 +26,9 @@ export interface WindowSummary {
   last_meaningful_activity_at_ms?: number; active_count: number; linked_session_count: number;
 }
 export interface WindowDetail extends WindowSummary {
-  linked_sessions: { session_id?: string; workflow_session_id?: string; title?: string; project?: string; lifecycle?: string }[];
-  activity: { tool_name?: string; meaningful?: boolean; status: string; project?: string; ended_at_ms?: number; started_at_ms?: number }[];
+  linked_sessions: { session_id?: string; workflow_session_id?: string; title?: string; project?: string; lifecycle?: string; last_linked_at_ms?: number }[];
+  active_requests?: { server_trace_id: string; tool_name?: string; project?: string; started_at_ms: number; elapsed_ms: number }[];
+  activity: WindowCall[];
   sessions_truncated: boolean; activity_truncated: boolean;
 }
 export interface GitSummary {
@@ -49,3 +51,18 @@ export type WorkspaceRequest =
   | { kind: "window"; client_window_key: string }
   | { kind: "instruction"; project: string; source_scope: string; path: string; fingerprint: string }
   | { kind: "plugin_reload"; project: string; plugin: string };
+
+export interface WindowCall {
+  server_trace_id?: string;
+  tool_name?: string; meaningful?: boolean; status: string; project?: string;
+  ended_at_ms?: number; started_at_ms?: number; request_observed_at_ms?: number; response_handed_at_ms?: number;
+  service_ms?: number; next_call_gap_ms?: number; window_transition_kind?: string; response_streaming?: boolean;
+  activity_presentation?: string; activity_kind?: string;
+}
+
+export interface UnregisterObservation {
+  target: import("./topology").SettingsTarget;
+  project: string;
+  expected_revision: string;
+  path: string;
+}

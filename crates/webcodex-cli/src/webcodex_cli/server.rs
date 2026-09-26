@@ -557,8 +557,8 @@ pub(crate) async fn run_server_status(opts: ServerStatusOptions) -> Result<Strin
     let tools_count = output
         .and_then(|v| v.pointer("/tools/count"))
         .and_then(Value::as_u64);
-    let agents_online_count = output
-        .and_then(|v| v.pointer("/agents/online_count"))
+    let runners_online_count = output
+        .and_then(|v| v.pointer("/runners/online_count"))
         .and_then(Value::as_u64);
     let server_build = runtime_build_metadata(output);
     let local_build = local_cli_build_metadata();
@@ -569,6 +569,7 @@ pub(crate) async fn run_server_status(opts: ServerStatusOptions) -> Result<Strin
     if opts.json {
         let summary = json!({
             "http_reachable": http.reachable,
+            "server_pid": output.and_then(|v| v.get("pid")).and_then(Value::as_u64),
             "probe_url": probe_url,
             "http_status_code": http.status_code,
             "http_content_type": http.content_type,
@@ -590,8 +591,8 @@ pub(crate) async fn run_server_status(opts: ServerStatusOptions) -> Result<Strin
             "tools": {
                 "count": tools_count,
             },
-            "agents": {
-                "online_count": agents_online_count,
+            "runners": {
+                "online_count": runners_online_count,
             },
             "server_build": {
                 "version": server_build.version,
@@ -606,6 +607,14 @@ pub(crate) async fn run_server_status(opts: ServerStatusOptions) -> Result<Strin
                 "built_at": local_build.built_at,
             },
             "revision_check": server_status_revision_check(&revision_comparison),
+            "desktop_runtime_contract": output.and_then(|v| v.get("desktop_runtime_contract")).cloned().unwrap_or(Value::Null),
+            "protocol_compatibility": output.and_then(|v| v.get("desktop_runtime_contract"))
+                .and_then(|v| serde_json::from_value::<webcodex_core::desktop_runtime_contract::DesktopRuntimeContract>(v.clone()).ok())
+                .filter(|range| range.is_valid())
+                .map(|range| if range.overlaps(webcodex_core::desktop_runtime_contract::DESKTOP_RUNTIME_CONTRACT) { "compatible" } else { "incompatible" })
+                .unwrap_or("unknown"),
+            "server_runner_protocol_compatibility": output.and_then(|v| v.get("protocol_compatibility")).cloned().unwrap_or(Value::Null),
+            "build_alignment": output.and_then(|v| v.get("build_alignment")).cloned().unwrap_or(Value::Null),
         });
         return serde_json::to_string_pretty(&summary).map_err(|e| e.to_string());
     }
@@ -615,7 +624,7 @@ pub(crate) async fn run_server_status(opts: ServerStatusOptions) -> Result<Strin
     } else {
         "Server: unreachable\n"
     });
-    if let Some(count) = agents_online_count {
+    if let Some(count) = runners_online_count {
         out.push_str(&format!("Runners online: {count}\n"));
     }
     out.push_str("\nNext:\n");
@@ -632,11 +641,11 @@ pub(crate) async fn run_server_status(opts: ServerStatusOptions) -> Result<Strin
         } else {
             out.push_str("  Start the WebCodex Server, then run this status command again.\n");
         }
-    } else if agents_online_count == Some(0) {
+    } else if runners_online_count == Some(0) {
         out.push_str(
             "  Create a one-time login code in another terminal with `webcodex pairing create`.\n",
         );
-    } else if agents_online_count.is_some_and(|count| count > 0) {
+    } else if runners_online_count.is_some_and(|count| count > 0) {
         out.push_str(
             "  Check project readiness on the project machine with `webcodex runner status`.\n",
         );
@@ -693,8 +702,8 @@ pub(crate) async fn run_server_status(opts: ServerStatusOptions) -> Result<Strin
             .unwrap_or_else(|| "unknown".to_string())
     ));
     out.push_str(&format!(
-        "  agents.online_count:   {}\n",
-        agents_online_count
+        "  runners.online_count:   {}\n",
+        runners_online_count
             .map(|v| v.to_string())
             .unwrap_or_else(|| "unknown".to_string())
     ));

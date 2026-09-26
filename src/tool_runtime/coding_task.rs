@@ -881,6 +881,8 @@ impl ToolRuntime {
             &runtime_status_for_brief,
             runtime_status_call_failed,
         );
+        let coding_agent_providers =
+            project_coding_agent_providers(&resolved.config.client_id, &runtime_status_for_brief);
         let git = self
             .coding_startup_git_summary(
                 &resolved.resolved_id,
@@ -1119,6 +1121,7 @@ impl ToolRuntime {
                     > 0,
             )
             .await;
+        let session_ref = self.session_reference_for_id(&session_summary.session_id, auth);
         let mut output = json!({
             "detail": detail.as_str(),
             "project": project.clone(),
@@ -1168,6 +1171,9 @@ impl ToolRuntime {
             "llm_summary": false,
             "warnings": warnings,
         });
+        if let Some(session_ref) = session_ref.as_deref() {
+            output["session"]["session_ref"] = json!(session_ref);
+        }
         if let Some(tool_manifest) = tool_manifest {
             output["tool_manifest"] = tool_manifest;
         }
@@ -1201,7 +1207,7 @@ impl ToolRuntime {
         let project_resolution_value =
             serde_json::to_value(&project_resolution).unwrap_or_else(|_| json!({}));
         let project_ref = self.project_reference_for_resolved(&resolved, auth);
-        let startup_brief = build_startup_brief(StartupBriefInput {
+        let mut startup_brief = build_startup_brief(StartupBriefInput {
             guidance_profile: startup.guidance_profile,
             detail,
             requested_project: &project,
@@ -1218,6 +1224,7 @@ impl ToolRuntime {
             force_instruction_load,
             include_instruction_content: startup.include_instruction_content,
             extensions: extensions.as_ref(),
+            coding_agent_providers: &coding_agent_providers,
             git: &git,
             semantic_navigation: &semantic_navigation,
             repository: &repository_overview,
@@ -1227,6 +1234,9 @@ impl ToolRuntime {
             canonical_repository_root_matches,
             runtime_status_call_failed,
         });
+        if let Some(session_ref) = session_ref.as_deref() {
+            startup_brief["session"]["session_ref"] = json!(session_ref);
+        }
         let result = if detail == StartupDetail::Full {
             output["startup_brief"] = startup_brief;
             ToolResult::ok(output)
@@ -1684,7 +1694,6 @@ impl ToolRuntime {
                     "tool": "present_work_result",
                     "arguments": {
                         "project": resolved.resolved_id.clone(),
-                        "session_id": session_id.clone(),
                     }
                 }
             })),
@@ -1752,6 +1761,27 @@ impl ToolRuntime {
             })
         };
 
+        // Reuse the handoff's exact read when present. An omitted or failed
+        // handoff still gets a single local report read for its own brief.
+        let external_observations = handoff
+            .pointer("/handoff_brief/external_observations")
+            .filter(|value| value.is_object())
+            .cloned()
+            .unwrap_or_else(|| {
+                self.handoff_external_observations(
+                    &session_id,
+                    projection_closeout_session_summary.project.as_deref(),
+                )
+            });
+        // When a nested handoff supplied the first snapshot, this comparison also
+        // spans the rest of closeout. With include_handoff=false it still fences
+        // the local read against a concurrent accepted external report.
+        let external_observations_changed_during_snapshot = external_observations
+            != self.handoff_external_observations(
+                &session_id,
+                projection_closeout_session_summary.project.as_deref(),
+            );
+
         let mut output = json!({
             "project": project,
             "resolved_project": resolved_project_payload(&resolved),
@@ -1790,9 +1820,11 @@ impl ToolRuntime {
             validation_requested: include_validation_summary,
             validation: output.get("validation"),
             jobs: output.get("jobs"),
+            external_observations: Some(&external_observations),
             guidance_available,
             existing_suggested_actions: output.get("suggested_next_actions"),
             session_changed_during_snapshot: false,
+            external_observations_changed_during_snapshot,
         });
         if let Some(follow_up) = self.active_goal_context_for_session(auth, &session_id) {
             output["goal_follow_up"] = follow_up;
@@ -2296,6 +2328,8 @@ struct WorkOnProjectBriefProjection {
     semantic_navigation: WorkOnProjectSemanticNavigationProjection,
     #[serde(default)]
     extensions: Option<Value>,
+    #[serde(default)]
+    coding_agent_providers: Vec<webcodex_core::coding_agent::CodingAgentProviderSummary>,
     repository: Value,
     continuation: WorkOnProjectContinuationProjection,
     blockers: Vec<String>,
@@ -2306,6 +2340,8 @@ struct WorkOnProjectBriefProjection {
 #[derive(Deserialize)]
 struct WorkOnProjectSessionProjection {
     session_id: String,
+    #[serde(default)]
+    session_ref: Option<String>,
     continuation: String,
     execution_context: sessions::SessionExecutionContext,
 }
@@ -2704,11 +2740,17 @@ fn project_work_on_project_output_inner(
     if let Some(knowledge_association) = projection.project.knowledge_association {
         result.output["knowledge_association"] = knowledge_association;
     }
+    if let Some(session_ref) = projection.session.session_ref {
+        result.output["session_ref"] = json!(session_ref);
+    }
     if let Some(project_ref) = projection.project.project_ref {
         result.output["project_ref"] = json!(project_ref);
     }
     if let Some(extensions) = projection.extensions {
         result.output["extensions"] = extensions;
+    }
+    if !projection.coding_agent_providers.is_empty() {
+        result.output["coding_agent_providers"] = json!(projection.coding_agent_providers);
     }
     if !project_resolution_is_default {
         let mut project_resolution = json!(projection.project_resolution);
@@ -3201,6 +3243,34 @@ fn startup_agent_check(
     }
 }
 
+/// Reuse the already-authorized startup observation, selecting only the Project's
+/// owning Runner. Never combine fleet inventories or choose a default provider.
+pub(crate) fn project_coding_agent_providers(
+    client_id: &str,
+    runtime_status: &Value,
+) -> Vec<webcodex_core::coding_agent::CodingAgentProviderSummary> {
+    runtime_status
+        .pointer("/runners/clients")
+        .and_then(Value::as_array)
+        .and_then(|clients| {
+            clients.iter().find(|client| {
+                client.get("client_id").and_then(Value::as_str) == Some(client_id)
+                    && client.get("connected").and_then(Value::as_bool) == Some(true)
+            })
+        })
+        .and_then(|client| client.get("coding_agent_providers"))
+        .and_then(|providers| {
+            serde_json::from_value::<Vec<webcodex_core::coding_agent::CodingAgentProviderSummary>>(
+                providers.clone(),
+            )
+            .ok()
+        })
+        .filter(|providers| {
+            providers.len() <= webcodex_core::coding_agent::CODING_AGENT_MAX_PROVIDERS
+        })
+        .unwrap_or_default()
+}
+
 fn owning_runner_available(
     resolved: &ResolvedProject,
     runtime_status: &Value,
@@ -3211,7 +3281,7 @@ fn owning_runner_available(
     }
     Some(
         runtime_status
-            .pointer("/agents/summary/clients")
+            .pointer("/runners/clients")
             .and_then(Value::as_array)
             .and_then(|clients| {
                 clients.iter().find(|client| {
@@ -3541,10 +3611,8 @@ mod startup_runner_tests {
     #[test]
     fn missing_target_runner_is_unavailable_even_when_a_peer_is_online() {
         let runtime_status = json!({
-            "agents": {
-                "summary": {
-                    "clients": [{"client_id": "peer", "status": "online"}]
-                }
+            "runners": {
+                "clients": [{"client_id": "peer", "status": "online"}]
             }
         });
         assert_eq!(
@@ -3556,18 +3624,35 @@ mod startup_runner_tests {
     #[test]
     fn target_runner_online_is_available_even_when_a_peer_is_stale() {
         let runtime_status = json!({
-            "agents": {
-                "summary": {
-                    "clients": [
-                        {"client_id": "peer", "status": "stale"},
-                        {"client_id": "target", "status": "online"}
-                    ]
-                }
+            "runners": {
+                "clients": [
+                    {"client_id": "peer", "status": "stale"},
+                    {"client_id": "target", "status": "online"}
+                ]
             }
         });
         assert_eq!(
             owning_runner_available(&resolved_agent("target"), &runtime_status, false),
             Some(true)
+        );
+    }
+    #[test]
+    fn runner_health_failure_stays_unknown_and_peer_does_not_mask_offline_target() {
+        let status = json!({"runners":{"clients":[
+            {"client_id":"target","status":"stale"},
+            {"client_id":"peer","status":"online"}
+        ]}});
+        assert_eq!(
+            owning_runner_available(&resolved_agent("target"), &status, false),
+            Some(false)
+        );
+        assert_eq!(
+            owning_runner_available(&resolved_agent("target"), &status, true),
+            None
+        );
+        assert_eq!(
+            startup_agent_check(&json!({}), None),
+            ("warn", Some("agent_health_unknown"))
         );
     }
 }

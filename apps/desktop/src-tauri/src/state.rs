@@ -1,7 +1,15 @@
+mod coding_agents;
 mod connections;
+mod diagnostics;
 mod mcp_providers;
 #[cfg(test)]
+mod projectless_tests;
+#[cfg(test)]
 mod reconfiguration_tests;
+mod runner_capability_grant;
+mod runtime_shell;
+mod ssh_resources;
+mod updates;
 mod workspace;
 mod workspace_settings;
 use crate::activity::{ActivityEventKind, ActivityLevel, ActivityLog};
@@ -22,7 +30,8 @@ use crate::operation::{
 use crate::process::{MachineEventReceiver, ProcessKey, ProcessPhase, ProcessSupervisor};
 use crate::tunnel_config::{TunnelConfig, TunnelConfigRequest};
 use crate::webcodex::{
-    inspect_project_path, ProjectRuntimeIdentity, QuickShareReadyEvent, WebCodexAdapter,
+    inspect_project_path, ProjectRuntimeIdentity, QuickShareReadyEvent, RunnerRuntimeIdentity,
+    WebCodexAdapter,
 };
 pub use connections::ConnectionAction;
 use serde_json::Value;
@@ -62,6 +71,7 @@ struct ChatGptActivityProbe {
 
 pub struct AppState {
     core: Mutex<Option<DesktopCore>>,
+    ssh_resources: Mutex<crate::ssh_resources::SshResourcesManager>,
     published: Arc<RwLock<DesktopStateSnapshot>>,
     supervisor: SharedSupervisor,
     activity: ActivityLog,
@@ -69,6 +79,7 @@ pub struct AppState {
     shutdown_signal: CancellationSignal,
     shutdown_started: AtomicBool,
     connections: ConnectionRuntimes,
+    update_check: tokio::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -80,6 +91,7 @@ impl AppState {
         let connections = core.connections.clone();
         Ok(Self {
             core: Mutex::new(Some(core)),
+            ssh_resources: Mutex::new(crate::ssh_resources::SshResourcesManager::default()),
             published,
             supervisor,
             connections,
@@ -87,6 +99,7 @@ impl AppState {
             activity,
             shutdown_signal: CancellationSignal::new(),
             shutdown_started: AtomicBool::new(false),
+            update_check: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -370,6 +383,15 @@ impl AppState {
         if self.shutdown_signal.is_cancelled() {
             return Err(cancelled_error());
         }
+        if kind != DesktopOperationKind::ConfigurationRestore
+            && self.get_state().configuration_issue.is_some()
+        {
+            return Err(DesktopError::new(
+                "configuration_migration_failed",
+                "Configuration could not be migrated",
+                "Open Diagnostics or explicitly restore the previous known-good configuration.",
+            ));
+        }
         let operation = self.operations.admit(kind, cancellable)?;
         let cancellation =
             CancellationContext::new(operation.cancellation.clone(), self.shutdown_signal.clone());
@@ -571,11 +593,19 @@ pub struct DesktopCore {
     data_dir: PathBuf,
     config_path: PathBuf,
     config: StoredDesktopConfig,
+    configuration_issue: Option<String>,
+    runtime_candidate: Option<crate::runtime_selection::RuntimeCandidate>,
+    runtime_candidate_context: Option<String>,
+    runtime_selected_probe: Option<crate::runtime_selection::RuntimeCandidate>,
+    runtime_last_switch: Option<crate::runtime_selection::RuntimeSwitchResult>,
     tunnel_config: TunnelConfig,
     mcp_providers: crate::mcp_providers::McpProviderStore,
     mcp_applied_revision: Option<u64>,
+    coding_agents: crate::coding_agents::CodingAgentStore,
+    coding_agents_applied_revision: Option<u64>,
     connections: ConnectionRuntimes,
     snapshot: DesktopStateSnapshot,
+    inventory_persistence_pending: bool,
     adapter: WebCodexAdapter,
     supervisor: SharedSupervisor,
     activity: ActivityLog,
@@ -586,12 +616,18 @@ impl DesktopCore {
     fn new(data_dir: PathBuf, resource_dir: PathBuf) -> DesktopResult<Self> {
         let activity = ActivityLog::default();
         let config_path = data_dir.join("desktop-state.json");
-        let config = load_config(&config_path, &activity)?;
+        // Keep Diagnostics usable if migration fails; admission below prevents
+        // replacing the operator's files with a default configuration.
+        let (config, configuration_issue) = match load_config(&config_path, &activity) {
+            Ok(config) => (config, None),
+            Err(error) => (StoredDesktopConfig::default(), Some(error.code)),
+        };
         let tunnel_config = TunnelConfig::load(
             &data_dir.join("secrets").join("tunnel-config.json"),
             config.preferred_connection == Some(RegularConnectionPreference::OpenAiTunnel),
         );
         let mut snapshot = DesktopStateSnapshot::default();
+        snapshot.configuration_issue = configuration_issue.clone();
         snapshot.topology = config.topology.clone();
         snapshot.project = project_snapshot(&config);
         if config.topology.is_some() && config.runtime_autostart == Some(false) {
@@ -624,18 +660,31 @@ impl DesktopCore {
         };
         let mcp_providers = crate::mcp_providers::McpProviderStore::load(&data_dir);
         snapshot.mcp_providers = mcp_providers.snapshot(None);
+        let coding_agents = crate::coding_agents::CodingAgentStore::load(&data_dir);
+        snapshot.coding_agents = coding_agents.snapshot(None);
         let published = Arc::new(RwLock::new(snapshot.clone()));
         let supervisor = Arc::new(Mutex::new(ProcessSupervisor::new(activity.clone())));
+        let mut adapter = WebCodexAdapter::new(Some(resource_dir.join("webcodex-runtime")));
+        adapter.set_runtime_source(config.runtime_binary_source.clone());
+        adapter.set_runtime_approval(config.runtime_binary_fingerprint.clone());
         Ok(Self {
             data_dir,
             config_path,
             config,
+            configuration_issue,
+            runtime_candidate: None,
+            runtime_candidate_context: None,
+            runtime_selected_probe: None,
+            runtime_last_switch: None,
             tunnel_config,
             mcp_providers,
             mcp_applied_revision: None,
+            coding_agents,
+            coding_agents_applied_revision: None,
             connections: ConnectionRuntimes::default(),
             snapshot,
-            adapter: WebCodexAdapter::new(Some(resource_dir.join("webcodex-runtime"))),
+            inventory_persistence_pending: false,
+            adapter,
             supervisor,
             activity,
             published,
@@ -718,7 +767,7 @@ impl DesktopCore {
             return self.get_state().await;
         }
 
-        let Some(identity) = identity_from_config(&self.config) else {
+        let Some(identity) = runner_identity_from_config(&self.config) else {
             self.snapshot.chatgpt_activity = None;
             self.snapshot.topology = self.config.topology.clone();
             self.snapshot.project = project_snapshot(&self.config);
@@ -765,15 +814,29 @@ impl DesktopCore {
             Err(_) => RunnerReadiness::Unknown,
         };
         cancellation.check()?;
-        let project = match self.adapter.project_ready(&identity, cancellation).await {
-            Ok(true) => ProjectReadiness::Ready,
-            Ok(false) => ProjectReadiness::ReloadRequired,
-            Err(_) => ProjectReadiness::Unknown,
+        let project_identity = identity_from_config(&self.config);
+        let project = if let Some(identity) = project_identity.as_ref() {
+            match self.adapter.project_ready(identity, cancellation).await {
+                Ok(true) => ProjectReadiness::Ready,
+                Ok(false) => ProjectReadiness::ReloadRequired,
+                Err(_) => ProjectReadiness::Unknown,
+            }
+        } else if self.config.project.is_some() {
+            ProjectReadiness::Configured
+        } else {
+            ProjectReadiness::None
         };
         cancellation.check()?;
         self.snapshot.chatgpt_activity =
             if server == ServerReadiness::Ready && project == ProjectReadiness::Ready {
-                match self.adapter.chatgpt_activity(&identity, cancellation).await {
+                match self
+                    .adapter
+                    .chatgpt_activity(
+                        project_identity.as_ref().expect("ready project"),
+                        cancellation,
+                    )
+                    .await
+                {
                     Ok(last_meaningful_activity_at_ms) => Some(ChatGptActivitySnapshot {
                         observed: last_meaningful_activity_at_ms.is_some(),
                         last_meaningful_activity_at_ms,
@@ -795,6 +858,9 @@ impl DesktopCore {
 
     fn publish_snapshot(&mut self) -> DesktopStateSnapshot {
         self.snapshot.mcp_providers = self.mcp_providers.snapshot(self.mcp_applied_revision);
+        self.snapshot.coding_agents = self
+            .coding_agents
+            .snapshot(self.coding_agents_applied_revision);
         self.project_connections();
         self.snapshot.current_operation = None;
         self.snapshot.activity_sequence = self.activity.latest_sequence();
@@ -917,28 +983,83 @@ impl DesktopCore {
         if topology.experience != Experience::Full {
             return self.get_state().await;
         }
-        let project_path = self
-            .config
-            .project
-            .as_ref()
-            .map(|project| project.path.clone());
-        match topology.server {
-            ServerTopology::Local => {
-                self.configure_local_setup(project_path.as_deref(), cancellation)
-                    .await
-            }
-            ServerTopology::Remote { url } => {
-                let project_path = project_path.ok_or_else(|| {
-                    DesktopError::new(
-                        "project_not_ready",
-                        "The saved remote Desktop runtime no longer has a project selection",
-                        "Choose a project or change the Desktop runtime setup.",
-                    )
+        let identity = runner_identity_from_config(&self.config).ok_or_else(|| {
+            DesktopError::new(
+                "runtime_not_ready",
+                "The saved Runtime identity is incomplete",
+                "Restore the saved Runner configuration and credentials.",
+            )
+        })?;
+        let runtime = self.config.runtime.clone().expect("validated runtime");
+        self.adapter.ensure_binaries(cancellation).await?;
+        crate::runtime_selection::verify_resolved_files(self.adapter.binaries()?).await?;
+        let deadline = Deadline::after(SERVER_READY_TIMEOUT);
+        let reachable = self
+            .adapter
+            .server_status_until(
+                Some(&identity.server_url),
+                runtime.server_env_file.as_deref(),
+                Some(&identity.user_token_file),
+                cancellation,
+                deadline,
+            )
+            .await
+            .is_ok_and(|status| status.http_reachable);
+        let mut server_started = false;
+        if !reachable
+            && matches!(topology.server, ServerTopology::Local)
+            && !process_is_active(self.process_snapshot(ProcessKey::LocalServer).await)
+        {
+            let env = runtime
+                .server_env_file
+                .as_deref()
+                .filter(|path| path.is_file())
+                .ok_or_else(|| {
+                    desktop_state_unavailable("The saved Server configuration is unavailable")
                 })?;
-                self.configure_remote_setup(&url, "", &project_path, cancellation)
-                    .await
-            }
+            let command = self.adapter.local_server_command(env)?;
+            self.spawn_owned(ProcessKey::LocalServer, command, false, cancellation)
+                .await?;
+            server_started = true;
         }
+        self.wait_for_server(
+            &identity.server_url,
+            runtime.server_env_file.as_deref(),
+            Some(&identity.user_token_file),
+            cancellation,
+            deadline,
+            server_started,
+        )
+        .await?;
+        let deadline = Deadline::after(RUNNER_READY_TIMEOUT);
+        let observation = self
+            .adapter
+            .observe_runner_connection(
+                &identity,
+                stored_runner_client_id(&self.config).as_deref(),
+                cancellation,
+            )
+            .await?;
+        let runner_started = !observation.online
+            && !process_is_active(self.process_snapshot(ProcessKey::LocalRunner).await);
+        if runner_started {
+            self.spawn_configured_runner(&identity, cancellation)
+                .await?;
+        }
+        self.wait_for_runner(&identity, cancellation, deadline, runner_started)
+            .await?;
+        if let Ok(overview) =
+            crate::workspace::query(&runtime, crate::workspace::WorkspaceRequest::Overview {}).await
+        {
+            self.reconcile_inventory(&overview).await;
+        }
+        cancellation.check()?;
+        self.config.runtime_autostart = Some(true);
+        self.save_config().await?;
+        // Observe only: never activate a saved display Project during recovery.
+        self.refresh_runtime_status(cancellation).await?;
+        self.autostart_connections(cancellation).await?;
+        self.get_state().await
     }
 
     pub async fn update_tunnel_proxy(
@@ -984,7 +1105,7 @@ impl DesktopCore {
 
         let project = self.adapter.inspect_project(project_path).await?;
         cancellation.check()?;
-        let identity = identity_from_config(&self.config).ok_or_else(|| {
+        let identity = runner_identity_from_config(&self.config).ok_or_else(|| {
             DesktopError::new(
                 "runtime_not_ready",
                 "The saved local Runner identity is incomplete",
@@ -1079,6 +1200,7 @@ impl DesktopCore {
         cancellation.check()?;
         let binaries = self.adapter.ensure_binaries(cancellation).await?.clone();
         self.snapshot.binaries = Some(binaries.info());
+        crate::runtime_selection::verify_resolved_files(&binaries).await?;
         self.activity.push(
             ActivityEventKind::LocalSetupPreparing,
             "desktop",
@@ -1126,8 +1248,7 @@ impl DesktopCore {
             status.probe_url
         };
         let mut server_deadline = Deadline::after(SERVER_READY_TIMEOUT);
-        let server_owned =
-            process_is_active(self.process_snapshot(ProcessKey::LocalServer).await);
+        let server_owned = process_is_active(self.process_snapshot(ProcessKey::LocalServer).await);
         let mut stale_loopback_conflict = false;
         let running = if !server_owned {
             match loopback_socket_from_server_url(&server_url) {
@@ -1205,7 +1326,7 @@ impl DesktopCore {
                 );
             }
         }
-        let reusable_identity = identity_from_config(&self.config)
+        let reusable_identity = runner_identity_from_config(&self.config)
             .filter(|identity| same_server(&identity.server_url, &server_url));
         let saved_runner_client_id = stored_runner_client_id(&self.config);
         cancellation.check()?;
@@ -1248,7 +1369,7 @@ impl DesktopCore {
                 .ok(),
             None => None,
         };
-        let (mut identity, identity_replaced, runner_client_id) =
+        let (identity, identity_replaced, runner_client_id) =
             match (reusable_identity, reusable_observation) {
                 (Some(identity), Some(observation)) => (identity, false, observation.client_id),
                 _ => {
@@ -1259,7 +1380,7 @@ impl DesktopCore {
                         .adapter
                         .create_local_pairing(&server_url, &env_file, cancellation)
                         .await?;
-                    let identity = self
+                    let project_identity = self
                         .adapter
                         .login_with_pairing(
                             &server_url,
@@ -1273,16 +1394,16 @@ impl DesktopCore {
                     cancellation.check()?;
                     let observation = self
                         .adapter
-                        .observe_runner_connection(&identity, None, cancellation)
+                        .observe_runner_connection(&project_identity, None, cancellation)
                         .await?;
-                    (identity, true, observation.client_id)
+                    (project_identity.runner, true, observation.client_id)
                 }
             };
 
         let replacing_owned_runner = identity_replaced
             && process_is_active(self.process_snapshot(ProcessKey::LocalRunner).await);
         let runner_deadline = Deadline::after(RUNNER_READY_TIMEOUT);
-        let activation: DesktopResult<bool> = async {
+        let activation: DesktopResult<(bool, ProjectRuntimeIdentity)> = async {
             if replacing_owned_runner {
                 // A Desktop-owned Runner can only serve the exact config it was
                 // started with. Replace that owned process transactionally while
@@ -1330,7 +1451,7 @@ impl DesktopCore {
                 .await?;
             self.snapshot.readiness.runner = RunnerReadiness::Ready;
             self.publish_snapshot();
-            identity = match self
+            let project_identity = match self
                 .adapter
                 .activate_project(&identity, &runner_client_id, &project, cancellation)
                 .await
@@ -1379,13 +1500,13 @@ impl DesktopCore {
                 }
                 Err(error) => return Err(error),
             };
-            self.wait_for_project(&identity, cancellation).await?;
+            self.wait_for_project(&project_identity, cancellation).await?;
             cancellation.check()?;
-            Ok(runner_started)
+            Ok((runner_started, project_identity))
         }
         .await;
-        let runner_started = match activation {
-            Ok(runner_started) => runner_started,
+        let (runner_started, identity) = match activation {
+            Ok(result) => result,
             Err(error) => {
                 if replacing_owned_runner {
                     self.stop_process_until(
@@ -1498,6 +1619,7 @@ impl DesktopCore {
         cancellation.check()?;
         let binaries = self.adapter.ensure_binaries(cancellation).await?.clone();
         self.snapshot.binaries = Some(binaries.info());
+        crate::runtime_selection::verify_resolved_files(&binaries).await?;
         let exposure = if server_url.starts_with("https://") {
             Exposure::ExistingHttps {
                 url: server_url.clone(),
@@ -1537,7 +1659,7 @@ impl DesktopCore {
         );
         self.publish_snapshot();
 
-        let reusable_identity = identity_from_config(&self.config)
+        let reusable_identity = runner_identity_from_config(&self.config)
             .filter(|identity| same_server(&identity.server_url, &server_url));
         let saved_runner_client_id = stored_runner_client_id(&self.config);
         let reusable_observation = match reusable_identity.as_ref() {
@@ -1552,7 +1674,7 @@ impl DesktopCore {
                 .ok(),
             None => None,
         };
-        let (mut identity, identity_replaced, runner_client_id) = match (
+        let (identity, identity_replaced, runner_client_id) = match (
             reusable_identity,
             reusable_observation,
         ) {
@@ -1565,7 +1687,7 @@ impl DesktopCore {
                             "Refresh this Runner connection with a new wc_pair_… code.",
                         ));
                 }
-                let identity = self
+                let project_identity = self
                     .adapter
                     .login_with_pairing(
                         &server_url,
@@ -1577,7 +1699,7 @@ impl DesktopCore {
                     .await?;
                 let observation = self
                     .adapter
-                    .observe_runner_connection(&identity, None, cancellation)
+                    .observe_runner_connection(&project_identity, None, cancellation)
                     .await?;
                 // A remote pairing code is one-shot. Publish the newly
                 // validated connection identity before Runner/project
@@ -1586,13 +1708,13 @@ impl DesktopCore {
                 self.config.topology = Some(topology.clone());
                 self.store_identity(
                     &project,
-                    &identity,
+                    &project_identity,
                     None,
                     Some(observation.client_id.clone()),
                 )
                 .await?;
                 cancellation.check()?;
-                (identity, true, observation.client_id)
+                (project_identity.runner, true, observation.client_id)
             }
         };
 
@@ -1662,7 +1784,7 @@ impl DesktopCore {
         };
         self.wait_for_runner(&identity, cancellation, runner_deadline, runner_started)
             .await?;
-        identity = match self
+        let identity = match self
             .adapter
             .activate_project(&identity, &runner_client_id, &project, cancellation)
             .await
@@ -1743,6 +1865,7 @@ impl DesktopCore {
         cancellation.check()?;
         let binaries = self.adapter.ensure_binaries(cancellation).await?.clone();
         self.snapshot.binaries = Some(binaries.info());
+        crate::runtime_selection::verify_resolved_files(&binaries).await?;
         if self
             .process_snapshot(ProcessKey::QuickShare)
             .await
@@ -2073,7 +2196,7 @@ impl DesktopCore {
 
     async fn wait_for_runner(
         &mut self,
-        identity: &ProjectRuntimeIdentity,
+        identity: &RunnerRuntimeIdentity,
         cancellation: &CancellationContext,
         deadline: Deadline,
         cleanup_owned_process: bool,
@@ -2419,6 +2542,22 @@ fn stored_runner_client_id(config: &StoredDesktopConfig) -> Option<String> {
         .map(str::to_string)
 }
 
+fn runner_identity_from_config(config: &StoredDesktopConfig) -> Option<RunnerRuntimeIdentity> {
+    let runtime = config.runtime.as_ref()?;
+    let client_id = stored_runner_client_id(config)?;
+    let runner_config = runtime.runner_config.clone()?;
+    let user_token_file = runtime.user_token_file.clone()?;
+    if !runner_config.is_file() || !user_token_file.is_file() {
+        return None;
+    }
+    Some(RunnerRuntimeIdentity {
+        client_id,
+        runner_config,
+        user_token_file,
+        server_url: runtime.server_url.clone(),
+    })
+}
+
 fn identity_from_config(config: &StoredDesktopConfig) -> Option<ProjectRuntimeIdentity> {
     let runtime = config.runtime.as_ref()?;
     let project = config.project.as_ref()?;
@@ -2437,9 +2576,12 @@ fn identity_from_config(config: &StoredDesktopConfig) -> Option<ProjectRuntimeId
         project_id,
         runtime_project_id,
         project_path: project.path.clone(),
-        runner_config,
-        user_token_file,
-        server_url: runtime.server_url.clone(),
+        runner: RunnerRuntimeIdentity {
+            client_id: stored_runner_client_id(config)?,
+            runner_config,
+            user_token_file,
+            server_url: runtime.server_url.clone(),
+        },
     })
 }
 
@@ -2451,11 +2593,17 @@ enum StoredConfigFile {
         bytes: Vec<u8>,
     },
     Corrupt,
+    Unsupported,
 }
 
 fn load_config(path: &Path, activity: &ActivityLog) -> DesktopResult<StoredDesktopConfig> {
     let backup_path = desktop_state_backup_path(path);
     match read_stored_config(path)? {
+        StoredConfigFile::Unsupported => Err(DesktopError::new(
+            "configuration_migration_failed",
+            "The saved configuration requires a newer Desktop schema",
+            "Update Desktop or explicitly restore the previous configuration from Diagnostics.",
+        )),
         StoredConfigFile::Valid { config, .. } => Ok(config),
         StoredConfigFile::Missing => match read_stored_config(&backup_path)? {
             StoredConfigFile::Missing => Ok(StoredDesktopConfig::default()),
@@ -2463,14 +2611,18 @@ fn load_config(path: &Path, activity: &ActivityLog) -> DesktopResult<StoredDeskt
                 recover_config_from_backup(path, &bytes, activity)?;
                 Ok(config)
             }
-            StoredConfigFile::Corrupt => Err(desktop_state_corrupt()),
+            StoredConfigFile::Corrupt | StoredConfigFile::Unsupported => {
+                Err(desktop_state_corrupt())
+            }
         },
         StoredConfigFile::Corrupt => match read_stored_config(&backup_path)? {
             StoredConfigFile::Valid { config, bytes } => {
                 recover_config_from_backup(path, &bytes, activity)?;
                 Ok(config)
             }
-            StoredConfigFile::Missing | StoredConfigFile::Corrupt => Err(desktop_state_corrupt()),
+            StoredConfigFile::Missing
+            | StoredConfigFile::Corrupt
+            | StoredConfigFile::Unsupported => Err(desktop_state_corrupt()),
         },
     }
 }
@@ -2514,7 +2666,8 @@ fn read_stored_config(path: &Path) -> DesktopResult<StoredConfigFile> {
             .with_details(serde_json::json!({ "io_kind": format!("{:?}", error.kind()) }))
     })?;
     match serde_json::from_slice::<StoredDesktopConfig>(&bytes) {
-        Ok(config) => Ok(StoredConfigFile::Valid { config, bytes }),
+        Ok(config) if config.schema_version == 1 => Ok(StoredConfigFile::Valid { config, bytes }),
+        Ok(_) => Ok(StoredConfigFile::Unsupported),
         Err(_) => Ok(StoredConfigFile::Corrupt),
     }
 }
@@ -2740,10 +2893,17 @@ fn read_desktop_server_env(env_file: &Path) -> DesktopResult<String> {
 
 fn desktop_server_listen_from_env(env_file: &Path) -> DesktopResult<String> {
     let content = read_desktop_server_env(env_file)?;
+    desktop_server_listen_from_content(&content)
+}
+
+fn desktop_server_listen_from_content(content: &str) -> DesktopResult<String> {
     let mut listen = None;
     for line in content.lines() {
         let candidate = line.trim_start();
-        let candidate = candidate.strip_prefix("export ").unwrap_or(candidate).trim_start();
+        let candidate = candidate
+            .strip_prefix("export ")
+            .unwrap_or(candidate)
+            .trim_start();
         let Some((key, value)) = candidate.split_once('=') else {
             continue;
         };
@@ -2829,7 +2989,10 @@ fn rewrite_desktop_server_address(env_file: &Path, listen: &str) -> DesktopResul
             (segment, "")
         };
         let candidate = body.trim_start();
-        let candidate = candidate.strip_prefix("export ").unwrap_or(candidate).trim_start();
+        let candidate = candidate
+            .strip_prefix("export ")
+            .unwrap_or(candidate)
+            .trim_start();
         let is_address = candidate
             .split_once('=')
             .is_some_and(|(key, _)| key.trim() == "WEBCODEX_ADDR");
@@ -2908,7 +3071,7 @@ fn exposure_readiness(topology: Option<&RuntimeTopology>) -> ExposureReadiness {
 struct EffectiveTunnelProxy {
     url: Option<String>,
     source: &'static str,
-    detected_url: Option<String>,
+    system_proxy_detected: bool,
 }
 
 fn validate_tunnel_proxy_url(value: &str) -> DesktopResult<String> {
@@ -2932,46 +3095,51 @@ fn environment_tunnel_proxy() -> Option<String> {
 }
 
 fn effective_tunnel_proxy(config: &TunnelProxyConfig) -> DesktopResult<EffectiveTunnelProxy> {
-    let system = crate::platform::system_http_proxy_candidate();
-    let detected_url = system.as_ref().map(|candidate| candidate.url.clone());
+    resolve_tunnel_proxy(
+        config,
+        environment_tunnel_proxy(),
+        crate::platform::system_http_proxy_candidate(),
+    )
+}
+
+fn resolve_tunnel_proxy(
+    config: &TunnelProxyConfig,
+    environment: Option<String>,
+    system: Option<crate::platform::SystemProxyCandidate>,
+) -> DesktopResult<EffectiveTunnelProxy> {
+    let system_proxy_detected = system.is_some();
     match config.mode {
         TunnelProxyMode::Direct => Ok(EffectiveTunnelProxy {
             url: None,
             source: "direct",
-            detected_url,
+            system_proxy_detected,
         }),
         TunnelProxyMode::Custom => Ok(EffectiveTunnelProxy {
             url: Some(validate_tunnel_proxy_url(
                 config.custom_url.as_deref().unwrap_or(""),
             )?),
             source: "custom",
-            detected_url,
+            system_proxy_detected,
         }),
         TunnelProxyMode::Auto => {
-            if let Some(url) = environment_tunnel_proxy() {
+            if let Some(url) = environment {
                 return Ok(EffectiveTunnelProxy {
                     url: Some(url),
                     source: "environment",
-                    detected_url,
+                    system_proxy_detected,
                 });
             }
             if let Some(candidate) = system {
-                if candidate.enabled || crate::platform::proxy_is_loopback(&candidate.url) {
-                    return Ok(EffectiveTunnelProxy {
-                        url: Some(candidate.url),
-                        source: if candidate.enabled {
-                            "windows_system"
-                        } else {
-                            "windows_loopback_candidate"
-                        },
-                        detected_url,
-                    });
-                }
+                return Ok(EffectiveTunnelProxy {
+                    url: Some(candidate.url),
+                    source: "system",
+                    system_proxy_detected,
+                });
             }
             Ok(EffectiveTunnelProxy {
                 url: None,
                 source: "direct",
-                detected_url,
+                system_proxy_detected,
             })
         }
     }
@@ -2992,6 +3160,10 @@ fn preferred_connection(config: &StoredDesktopConfig) -> RegularConnectionPrefer
 }
 
 fn apply_config_projection(snapshot: &mut DesktopStateSnapshot, config: &StoredDesktopConfig) {
+    snapshot.workspace_runner = config
+        .runtime
+        .as_ref()
+        .and_then(|runtime| crate::webcodex::settings::target(runtime).ok());
     snapshot.saved_projects = config
         .saved_projects
         .iter()
@@ -3011,17 +3183,19 @@ fn apply_config_projection(snapshot: &mut DesktopStateSnapshot, config: &StoredD
             mode: config.tunnel_proxy.mode,
             custom_url: config.tunnel_proxy.custom_url.clone(),
             effective_source: proxy.source.to_string(),
-            effective_url: proxy.url,
-            detected_url: proxy.detected_url,
+            effective_proxy_present: proxy.url.is_some(),
+            system_proxy_detected: proxy.system_proxy_detected,
         },
-        Err(_) => TunnelProxySnapshot {
-            mode: config.tunnel_proxy.mode,
-            custom_url: config.tunnel_proxy.custom_url.clone(),
-            effective_source: "invalid_custom".to_string(),
-            effective_url: None,
-            detected_url: crate::platform::system_http_proxy_candidate()
-                .map(|candidate| candidate.url),
-        },
+        Err(_) => {
+            let system = crate::platform::system_http_proxy_candidate();
+            TunnelProxySnapshot {
+                mode: config.tunnel_proxy.mode,
+                custom_url: config.tunnel_proxy.custom_url.clone(),
+                effective_source: "invalid_custom".to_string(),
+                effective_proxy_present: false,
+                system_proxy_detected: system.is_some(),
+            }
+        }
     };
 }
 
@@ -3103,9 +3277,7 @@ mod tests {
         let content = std::fs::read_to_string(&env_file).unwrap();
         assert!(content.starts_with("WEBCODEX_ADDR=127.0.0.1:12345\n"));
         assert!(content.contains("WEBCODEX_MCP_COMPACT_SCHEMAS=true\n"));
-        assert!(content.contains(
-            "WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true\n"
-        ));
+        assert!(content.contains("WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true\n"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -3122,12 +3294,10 @@ mod tests {
         );
         std::fs::write(&env_file, original).unwrap();
 
-        let recovered = recover_stale_desktop_loopback_address(
-            &env_file,
-            &format!("http://{occupied_addr}"),
-        )
-        .unwrap()
-        .expect("occupied persisted loopback address should recover");
+        let recovered =
+            recover_stale_desktop_loopback_address(&env_file, &format!("http://{occupied_addr}"))
+                .unwrap()
+                .expect("occupied persisted loopback address should recover");
         assert_ne!(recovered, format!("http://{occupied_addr}"));
 
         let recovered_addr =
@@ -3164,21 +3334,14 @@ mod tests {
         std::fs::write(&env_file, &original).unwrap();
 
         assert_eq!(
-            recover_stale_desktop_loopback_address(
-                &env_file,
-                &format!("http://{bindable_addr}")
-            )
-            .unwrap(),
+            recover_stale_desktop_loopback_address(&env_file, &format!("http://{bindable_addr}"))
+                .unwrap(),
             None
         );
         assert_eq!(std::fs::read_to_string(&env_file).unwrap(), original);
 
         assert_eq!(
-            recover_stale_desktop_loopback_address(
-                &env_file,
-                "https://example.com:8443"
-            )
-            .unwrap(),
+            recover_stale_desktop_loopback_address(&env_file, "https://example.com:8443").unwrap(),
             None
         );
         assert_eq!(std::fs::read_to_string(&env_file).unwrap(), original);
@@ -3194,13 +3357,11 @@ mod tests {
             "WEBCODEX_ADDR=127.0.0.1:1111\nWEBCODEX_TOKEN=secret\nWEBCODEX_ADDR=127.0.0.1:2222\n";
         std::fs::write(&env_file, original).unwrap();
 
-        let error =
-            rewrite_desktop_server_address(&env_file, "127.0.0.1:3333").unwrap_err();
+        let error = rewrite_desktop_server_address(&env_file, "127.0.0.1:3333").unwrap_err();
         assert_eq!(error.code, "desktop_state_invalid");
         assert_eq!(std::fs::read_to_string(&env_file).unwrap(), original);
         std::fs::remove_dir_all(dir).unwrap();
     }
-
 
     fn unique_state_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -3227,6 +3388,7 @@ mod tests {
             preferred_connection: None,
             tunnel_proxy: TunnelProxyConfig::default(),
             runtime: None,
+            ..StoredDesktopConfig::default()
         }
     }
 
@@ -3589,6 +3751,52 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_proxy_resolution_has_explicit_precedence() {
+        let auto = TunnelProxyConfig::default();
+        let system = crate::platform::SystemProxyCandidate {
+            url: "http://127.0.0.1:7890".to_string(),
+        };
+        let environment = "http://environment.example.test:8080".to_string();
+
+        let resolved =
+            resolve_tunnel_proxy(&auto, Some(environment.clone()), Some(system.clone())).unwrap();
+        assert_eq!(resolved.source, "environment");
+        assert_eq!(resolved.url.as_deref(), Some(environment.as_str()));
+        assert!(resolved.system_proxy_detected);
+
+        let resolved = resolve_tunnel_proxy(&auto, None, Some(system.clone())).unwrap();
+        assert_eq!(resolved.source, "system");
+        assert_eq!(resolved.url.as_deref(), Some(system.url.as_str()));
+        assert!(resolved.system_proxy_detected);
+
+        let resolved = resolve_tunnel_proxy(&auto, None, None).unwrap();
+        assert_eq!(resolved.source, "direct");
+        assert_eq!(resolved.url, None);
+        assert!(!resolved.system_proxy_detected);
+
+        let custom = TunnelProxyConfig {
+            mode: TunnelProxyMode::Custom,
+            custom_url: Some("http://custom.example.test:9000".to_string()),
+        };
+        let resolved =
+            resolve_tunnel_proxy(&custom, Some(environment.clone()), Some(system.clone())).unwrap();
+        assert_eq!(resolved.source, "custom");
+        assert_eq!(
+            resolved.url.as_deref(),
+            Some("http://custom.example.test:9000")
+        );
+
+        let direct = TunnelProxyConfig {
+            mode: TunnelProxyMode::Direct,
+            custom_url: Some("http://ignored.example.test:9000".to_string()),
+        };
+        let resolved = resolve_tunnel_proxy(&direct, Some(environment), Some(system)).unwrap();
+        assert_eq!(resolved.source, "direct");
+        assert_eq!(resolved.url, None);
+        assert!(resolved.system_proxy_detected);
+    }
+
+    #[test]
     fn failed_runtime_resume_restores_the_last_published_state() {
         let data_dir = unique_state_dir("resume-failure-reconcile");
         let mut core = DesktopCore::new(data_dir.clone(), data_dir.join("resources"))
@@ -3667,6 +3875,7 @@ mod tests {
                 project_id: Some("repo".to_string()),
                 runtime_project_id: Some("agent:desktop:repo".to_string()),
             }),
+            ..StoredDesktopConfig::default()
         };
         assert_eq!(
             project_snapshot(&config).and_then(|project| project.runtime_project_id),
@@ -4278,7 +4487,9 @@ mod tests {
             .expect("recovered local loopback address");
         assert_ne!(second_addr, first_addr);
         assert_eq!(
-            occupied.local_addr().expect("occupied address remains live"),
+            occupied
+                .local_addr()
+                .expect("occupied address remains live"),
             first_addr,
             "Desktop recovery must not disturb the external process holding the old port"
         );

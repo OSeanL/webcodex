@@ -9,6 +9,8 @@ use webcodex_core::plugin::{validate_provider_id, validate_provider_name, PLUGIN
 
 mod mcp;
 pub use mcp::reconcile_mcp;
+mod acp;
+pub use acp::reconcile_acp;
 
 const MAX_BYTES: u64 = 256 * 1024;
 
@@ -19,7 +21,7 @@ pub struct RunnerPaths {
     pub skill_roots: Vec<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsTarget {
     pub config_path: std::path::PathBuf,

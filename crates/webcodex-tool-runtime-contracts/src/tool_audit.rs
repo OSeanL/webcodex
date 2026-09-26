@@ -3,7 +3,9 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use webcodex_core::audit_preview::{command_preview, process_preview};
-use webcodex_core::runner_protocol::{normalize_cargo_value, normalize_rust_test_filter};
+use webcodex_core::runner_protocol::{
+    normalize_cargo_packages, normalize_cargo_value, normalize_rust_test_filter,
+};
 use webcodex_core::workflow_session_contract::is_validation_like_execution_purpose;
 #[cfg(test)]
 use webcodex_tool_contracts::tool_call::ComputerSnapshotRegion;
@@ -295,6 +297,7 @@ fn typed_structured_validation_request_audit(
                     "all_features",
                     "no_default_features",
                     "package",
+                    "packages",
                     "timeout_secs",
                 ],
             );
@@ -554,16 +557,17 @@ fn typed_agent_task_request_audit(kind: AgentTaskRequestAudit, arguments: &Value
             );
         }
         AgentTaskRequestAudit::StartEndpointContinuation => {
-            copy_keys(
-                obj,
-                &mut out,
-                &[
-                    "task_id",
-                    "attempt_id",
-                    "assignee_agent_id",
-                    "attempt_controller_generation",
-                ],
-            );
+            for key in [
+                "attempt_ref",
+                "task_id",
+                "attempt_id",
+                "assignee_agent_id",
+                "attempt_controller_generation",
+            ] {
+                if let Some(value) = obj.get(key).filter(|value| !value.is_null()) {
+                    out.insert((*key).to_string(), value.clone());
+                }
+            }
             out.insert(
                 "attempt_fence_present".to_string(),
                 Value::Bool(obj.get("attempt_fence").and_then(Value::as_str).is_some()),
@@ -1597,7 +1601,7 @@ fn canonical_cargo_validation_target(
         }
         "check" | "test" => {
             let is_test = subcommand == "test";
-            let mut package: Option<String> = None;
+            let mut packages = Vec::new();
             let mut features: Option<String> = None;
             let mut filter: Option<String> = None;
             let mut all_targets = false;
@@ -1611,13 +1615,15 @@ fn canonical_cargo_validation_target(
                 match arg.as_str() {
                     "-p" | "--package" | "--features" => {
                         let value = rest.get(index + 1)?.clone();
-                        let slot = if arg == "--features" {
-                            &mut features
+                        if arg == "--features" {
+                            if features.replace(value).is_some() {
+                                return None;
+                            }
                         } else {
-                            &mut package
-                        };
-                        if slot.replace(value).is_some() {
-                            return None;
+                            if is_test && !packages.is_empty() {
+                                return None;
+                            }
+                            packages.push(value);
                         }
                         index += 2;
                         continue;
@@ -1627,8 +1633,8 @@ fn canonical_cargo_validation_target(
                     "--all-features" if !all_features => all_features = true,
                     "--no-default-features" if !no_default_features => no_default_features = true,
                     "--no-run" if is_test && !no_run => no_run = true,
-                    _ if arg.starts_with("--package=") && package.is_none() => {
-                        package = Some(arg.trim_start_matches("--package=").to_string());
+                    _ if arg.starts_with("--package=") && (!is_test || packages.is_empty()) => {
+                        packages.push(arg.trim_start_matches("--package=").to_string());
                     }
                     _ if arg.starts_with("--features=") && features.is_none() => {
                         features = Some(arg.trim_start_matches("--features=").to_string());
@@ -1640,15 +1646,23 @@ fn canonical_cargo_validation_target(
                 }
                 index += 1;
             }
-            let package = match package {
-                Some(value) => normalize_cargo_value(&value).ok()?,
-                None => None,
-            };
+            let packages = normalize_cargo_packages(
+                None,
+                (!packages.is_empty()).then_some(packages.as_slice()),
+            )
+            .ok()?;
             let features = match features {
                 Some(value) => normalize_cargo_value(&value).ok()?,
                 None => None,
             };
-            input.insert("package".to_string(), serde_json::json!(package));
+            if is_test {
+                input.insert(
+                    "package".to_string(),
+                    serde_json::json!(packages.and_then(|mut values| values.pop())),
+                );
+            } else {
+                input.insert("packages".to_string(), serde_json::json!(packages));
+            }
             input.insert("features".to_string(), serde_json::json!(features));
             input.insert("all_targets".to_string(), Value::Bool(all_targets));
             input.insert("all_features".to_string(), Value::Bool(all_features));
@@ -1831,6 +1845,33 @@ mod execution_purpose_classification_tests {
             run_process_validation_identity("custom-validator", &args, None, Some("."), None)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn native_multi_package_cargo_check_matches_structured_identity() {
+        let args = vec![
+            "check".to_string(),
+            "--all-targets".to_string(),
+            "-p".to_string(),
+            "package-b".to_string(),
+            "-p".to_string(),
+            "package-a".to_string(),
+        ];
+        let native =
+            run_process_validation_identity("cargo", &args, None, Some("."), Some("validation"))
+                .expect("canonical Cargo validation identity");
+        let structured = webcodex_core::validation_identity::structured_validation_target_identity(
+            webcodex_core::validation_identity::ToolValidationIdentityKind::CargoCheck,
+            &serde_json::json!({
+                "cwd": ".",
+                "all_targets": true,
+                "packages": ["package-a", "package-b"]
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(native.validation_tool, Some("cargo_check"));
+        assert_eq!(native.identity, structured);
     }
 }
 
@@ -2446,6 +2487,79 @@ mod computer_privacy_tests {
         }
         .session_log_arguments();
         assert!(!activation_request.to_string().contains(PRIVATE_KEY));
+    }
+
+    #[test]
+    fn agent_task_attempt_ref_audit_keeps_canonical_ids_and_omits_fence() {
+        const PRIVATE_FENCE: &str = "wc_agent_task_fence_PRIVATE_FENCE_MUST_NOT_PERSIST";
+        let by_ref = session_log_arguments_for_tool_request(
+            "start_agent_task_endpoint_continuation",
+            &json!({
+                "attempt_ref": "~ta4",
+                "attempt_fence": PRIVATE_FENCE,
+            }),
+        );
+        assert_eq!(by_ref["attempt_ref"], "~ta4");
+        assert_eq!(by_ref["attempt_fence_present"], true);
+        assert!(by_ref.get("task_id").is_none());
+        assert!(!by_ref.to_string().contains(PRIVATE_FENCE));
+
+        let typed = ToolCall::StartAgentTaskEndpointContinuation {
+            attempt_ref: Some("~ta4".to_string()),
+            task_id: None,
+            attempt_id: None,
+            assignee_agent_id: None,
+            attempt_fence: Some(PRIVATE_FENCE.to_string()),
+            attempt_controller_generation: None,
+        }
+        .session_log_arguments();
+        assert_eq!(typed["attempt_ref"], "~ta4");
+        assert_eq!(typed["attempt_fence_present"], true);
+        assert!(typed.get("task_id").is_none());
+        assert!(!typed.to_string().contains(PRIVATE_FENCE));
+
+        let by_tuple = ToolCall::StartAgentTaskEndpointContinuation {
+            attempt_ref: None,
+            task_id: Some("wc_agent_task_iavN7wEjRWeJq83v".to_string()),
+            attempt_id: Some("wc_agent_task_attempt_iavN7wEjRWeJq83v".to_string()),
+            assignee_agent_id: Some("wc_dagent_iavN7wEjRWeJq83v".to_string()),
+            attempt_fence: Some(PRIVATE_FENCE.to_string()),
+            attempt_controller_generation: Some(2),
+        }
+        .session_log_arguments();
+        assert_eq!(by_tuple["task_id"], "wc_agent_task_iavN7wEjRWeJq83v");
+        assert_eq!(
+            by_tuple["attempt_id"],
+            "wc_agent_task_attempt_iavN7wEjRWeJq83v"
+        );
+        assert_eq!(by_tuple["attempt_controller_generation"], 2);
+        assert_eq!(by_tuple["attempt_fence_present"], true);
+        assert!(by_tuple.get("attempt_ref").is_none());
+        assert!(!by_tuple.to_string().contains(PRIVATE_FENCE));
+
+        let result = session_log_result_for_tool(
+            "start_agent_task_endpoint_continuation",
+            &json!({
+                "execution": {
+                    "task_id": "wc_agent_task_iavN7wEjRWeJq83v",
+                    "attempt_id": "wc_agent_task_attempt_iavN7wEjRWeJq83v",
+                    "wake_id": "wc_wake_iavN7wEjRWeJq83v",
+                    "wake_state": "pending",
+                    "endpoint_id": null,
+                    "endpoint_controller_generation": null
+                },
+                "attempt_fence": PRIVATE_FENCE,
+                "replayed": false,
+                "state_changed": true
+            }),
+        );
+        assert_eq!(result["task_id"], "wc_agent_task_iavN7wEjRWeJq83v");
+        assert_eq!(
+            result["attempt_id"],
+            "wc_agent_task_attempt_iavN7wEjRWeJq83v"
+        );
+        assert_eq!(result["wake_id"], "wc_wake_iavN7wEjRWeJq83v");
+        assert!(!result.to_string().contains(PRIVATE_FENCE));
     }
 
     #[test]
@@ -4242,6 +4356,7 @@ impl ToolCallAuditProjection for ToolCall {
                 no_default_features,
                 features,
                 package,
+                packages,
                 timeout_secs,
                 sync_wait_secs,
                 ..
@@ -4255,6 +4370,7 @@ impl ToolCallAuditProjection for ToolCall {
                     "no_default_features": no_default_features,
                     "features": features,
                     "package": package,
+                    "packages": packages,
                     "timeout_secs": timeout_secs,
                     "sync_wait_secs": sync_wait_secs,
                 }),
@@ -4522,6 +4638,7 @@ impl ToolCallAuditProjection for ToolCall {
                 }),
             ),
             Self::StartAgentTaskEndpointContinuation {
+                attempt_ref,
                 task_id,
                 attempt_id,
                 assignee_agent_id,
@@ -4530,6 +4647,7 @@ impl ToolCallAuditProjection for ToolCall {
             } => typed_agent_task_request_audit(
                 AgentTaskRequestAudit::StartEndpointContinuation,
                 &serde_json::json!({
+                    "attempt_ref": attempt_ref,
                     "task_id": task_id,
                     "attempt_id": attempt_id,
                     "assignee_agent_id": assignee_agent_id,
@@ -4678,11 +4796,17 @@ impl ToolCallAuditProjection for ToolCall {
                 }),
             ),
             Self::PresentAgentContinuation {
+                agent_continuation_ref,
                 agent_id,
                 endpoint_id,
                 expected_controller_generation,
-            }
-            | Self::AgentContinuationBind {
+            } => serde_json::json!({
+                "agent_continuation_ref": agent_continuation_ref,
+                "agent_id": agent_id,
+                "endpoint_id": endpoint_id,
+                "expected_controller_generation": expected_controller_generation,
+            }),
+            Self::AgentContinuationBind {
                 agent_id,
                 endpoint_id,
                 expected_controller_generation,
@@ -5510,6 +5634,17 @@ impl ToolCallAuditProjection for ToolCall {
                 "checkpoint_id": checkpoint_id,
                 "confirm": confirm,
             }),
+            Self::RecordExternalObservation {
+                project,
+                session_id,
+                ..
+            }
+            | Self::ListExternalObservations {
+                project,
+                session_id,
+            } => serde_json::json!({
+                "project": project, "session_id": session_id,
+            }),
             Self::PostSessionMessage {
                 session_id,
                 kind,
@@ -5518,6 +5653,7 @@ impl ToolCallAuditProjection for ToolCall {
                 reply_to,
                 priority,
                 requires_ack,
+                delivery_key: _,
             } => serde_json::json!({
                 "session_id": session_id,
                 "kind": kind,
@@ -5535,6 +5671,7 @@ impl ToolCallAuditProjection for ToolCall {
                 tags,
                 priority,
                 requires_ack,
+                delivery_key: _,
             } => serde_json::json!({
                 "peer_id": peer_id,
                 "kind": kind,
@@ -5619,6 +5756,13 @@ impl ToolCallAuditProjection for ToolCall {
                 "diagnostic": diagnostic,
                 "limit": limit,
             }),
+            Self::SessionHandoffState {
+                project,
+                session_id,
+            } => serde_json::json!({
+                "project": project,
+                "session_id": session_id,
+            }),
             Self::StartSession {
                 project,
                 title,
@@ -5695,6 +5839,17 @@ impl ToolCallAuditProjection for ToolCall {
             } => serde_json::json!({
                 "project": project,
                 "session_id": session_id,
+            }),
+            Self::WorkResultSendMessage {
+                project,
+                session_id,
+                message,
+                delivery_key,
+            } => serde_json::json!({
+                "project": project,
+                "session_id": session_id,
+                "message_chars": message.chars().count(),
+                "delivery_key_present": !delivery_key.is_empty(),
             }),
             Self::ChangesFileDiff {
                 project,
@@ -5932,6 +6087,13 @@ impl ToolCallAuditProjection for ToolCall {
                 "compact": compact,
                 "summary_only": summary_only,
                 "client_id_present": client_id.is_some(),
+            }),
+            Self::CurrentWindowActivity {
+                limit,
+                include_nonmeaningful,
+            } => serde_json::json!({
+                "limit": limit,
+                "include_nonmeaningful": include_nonmeaningful,
             }),
             Self::WorkspaceHygieneCheck {
                 project,

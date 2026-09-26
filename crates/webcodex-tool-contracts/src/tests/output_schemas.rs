@@ -45,7 +45,7 @@ fn structured_execution_output(
                     "job_id": job_id.expect("promoted Job id"),
                     "after_observation_token": "observation"
                 }],
-                "wait_secs": webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS,
+                "wait_secs": webcodex_core::runtime_contract::DEFAULT_JOB_CONTINUATION_WAIT_SECS,
                 "wake_on": "terminal"
             }
         });
@@ -448,6 +448,15 @@ fn agent_identity_listing_readiness_schema_is_sparse_and_non_authoritative() {
         .unwrap()
         .iter()
         .any(|field| field == "production_auto_resume_available"));
+    assert!(agent["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "agent_continuation_ref"));
+    assert_eq!(
+        properties["agent_continuation_ref"]["anyOf"][0]["pattern"],
+        crate::AGENT_CONTINUATION_REF_PATTERN
+    );
     for forbidden in [
         "client_window",
         "client_window_key",
@@ -503,6 +512,26 @@ fn job_terminal_continuation_output_schemas_are_sparse_and_private_app_payload_i
     assert_eq!(automatic_message["maxLength"], 1024);
     let serialized = serde_json::to_string(&prepare).unwrap();
     assert!(!serialized.contains("binding_id"));
+}
+
+#[test]
+fn start_agent_task_attempt_schema_returns_ref_without_replacing_fence() {
+    let schema = output_schema_for_tool("start_agent_task_attempt");
+    let properties = schema["properties"]["output"]["properties"]
+        .as_object()
+        .unwrap();
+    assert!(properties.contains_key("attempt_fence"));
+    assert!(properties.contains_key("attempt_ref"));
+    assert!(properties["attempt_ref"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("Not a credential"));
+    let read = output_schema_for_tool("read_agent_task");
+    let latest_attempt = &read["properties"]["output"]["properties"]["task"]["properties"]
+        ["summary"]["properties"]["latest_attempt"]["anyOf"][0];
+    let read_properties = latest_attempt["properties"].as_object().unwrap();
+    assert!(!read_properties.contains_key("attempt_ref"));
+    assert!(!read_properties.contains_key("attempt_fence"));
 }
 
 #[test]
@@ -1107,6 +1136,7 @@ fn key_tool_output_schemas_include_expected_fields() {
             "outcome_unknown",
             "completed",
             "timed_out",
+            "pending",
             "queued",
             "running"
         ])
@@ -1271,7 +1301,14 @@ fn key_tool_output_schemas_include_expected_fields() {
     }
     assert_eq!(
         output_schema_property(&specs, "run_script", "language")["enum"],
-        serde_json::json!(["sh", "bash", "powershell", "javascript", "typescript"])
+        serde_json::json!([
+            "sh",
+            "bash",
+            "powershell",
+            "python",
+            "javascript",
+            "typescript"
+        ])
     );
     assert_eq!(
         output_schema_property(&specs, "run_script", "execution_source")["const"],
@@ -1544,8 +1581,13 @@ fn key_tool_output_schemas_include_expected_fields() {
             webcodex_core::runtime_contract::MAX_JOB_OBSERVATION_WAIT_SECS
         );
         assert_eq!(
-            continuation["properties"]["arguments"]["properties"]["wait_secs"]["const"],
-            webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS
+            continuation["properties"]["arguments"]["properties"]["wait_secs"]["minimum"],
+            1
+        );
+        assert!(
+            continuation["properties"]["arguments"]["properties"]["wait_secs"]
+                .get("const")
+                .is_none()
         );
         assert_eq!(
             continuation["properties"]["arguments"]["properties"]["wake_on"]["const"],
@@ -1555,6 +1597,27 @@ fn key_tool_output_schemas_include_expected_fields() {
             .as_array()
             .unwrap()
             .contains(&serde_json::json!("wake_on")));
+        let pending_strategy = output_schema_property(&specs, name, "pending_strategy");
+        assert_eq!(
+            pending_strategy["properties"]["default"]["const"],
+            "continue_independent_work"
+        );
+        assert_eq!(
+            pending_strategy["properties"]["passive_terminal_attention"]["const"],
+            "same_scope_may_surface"
+        );
+        assert_eq!(
+            pending_strategy["properties"]["observe_continuation"]["const"],
+            "logs_details_recovery_fallback"
+        );
+        assert_eq!(
+            pending_strategy["properties"]["observe_auto_follow"]["const"],
+            false
+        );
+        assert_eq!(
+            pending_strategy["properties"]["blocked_fallback"]["const"],
+            "wait_for_job_terminal"
+        );
         assert!(
             has_output_field(name, "failure_kind"),
             "{name} missing failure_kind"
@@ -1575,12 +1638,11 @@ fn key_tool_output_schemas_include_expected_fields() {
             .as_str()
             .expect("cargo execution_state description");
         for state in [
+            "pending",
             "not_started",
             "outcome_unknown",
             "completed",
             "timed_out",
-            "queued",
-            "running",
         ] {
             assert!(
                 state_description.contains(state),
@@ -1899,7 +1961,7 @@ fn key_tool_output_schemas_include_expected_fields() {
         "auth_enabled",
         "configured_public_url",
         "effective_config",
-        "agents",
+        "runners",
         "projects",
         "jobs",
         "tools",
@@ -1910,6 +1972,13 @@ fn key_tool_output_schemas_include_expected_fields() {
             has_output_field("runtime_status", field),
             "runtime_status missing {field}"
         );
+    }
+    assert!(!has_output_field("runtime_status", "agents"));
+    for field in ["runners", "summary", "count"] {
+        assert!(has_output_field("list_runners", field));
+    }
+    for legacy in ["agents", "clients"] {
+        assert!(!has_output_field("list_runners", legacy));
     }
     for field in ["projects", "count", "recommended_for_smoke"] {
         assert!(
@@ -2397,6 +2466,110 @@ fn skill_recovery_output_schema_accepts_canonical_shapes_and_declares_legacy_rej
 
 fn default_output_schema_field_names() -> BTreeSet<&'static str> {
     BTreeSet::from(["session_hint", "permission", "recovery_kind"])
+}
+
+#[test]
+fn model_visible_output_schemas_admit_bounded_passive_job_attention() {
+    let attention = json!({
+        "changed": true,
+        "items": [{
+            "job_id": "wc_job_schema",
+            "tool": "cargo_test",
+            "status": "completed",
+            "state": "terminal",
+            "outcome": "passed",
+            "exit_code": 0,
+            "command_ok": true,
+            "validation": {
+                "tool": "cargo_test",
+                "kind": "test",
+                "state": "completed",
+                "passed": null,
+                "source_state": {
+                    "freshness": "unproven",
+                    "observed_mutation_fence": "unknown"
+                }
+            },
+            "details": {
+                "tool": "observe_jobs",
+                "arguments": {"items": [{"job_id": "wc_job_schema"}]}
+            }
+        }]
+    });
+    let specs = registered_tool_specs();
+    for spec in &specs {
+        let fields = output_schema_field_names(spec);
+        assert_eq!(
+            fields.contains("job_attention"),
+            runtime_tool_supports_passive_job_attention(&spec.name),
+            "{} passive-attention schema eligibility must match canonical runtime policy",
+            spec.name
+        );
+    }
+
+    let cargo_check = spec_named(&specs, "cargo_check");
+    let field = cargo_check.output_schema["properties"]["output"]["properties"]
+        .get("job_attention")
+        .expect("cargo_check must declare passive job_attention");
+    test_support::validate_schema_instance(&attention, field)
+        .expect("cargo_check passive job_attention shape must validate");
+    let pending = json!({
+        "success": true,
+        "output": {
+            "execution_state": "pending",
+            "pending_strategy": {
+                "default": "continue_independent_work",
+                "passive_terminal_attention": "same_scope_may_surface",
+                "observe_continuation": "logs_details_recovery_fallback",
+                "observe_auto_follow": false,
+                "blocked_fallback": "wait_for_job_terminal"
+            },
+            "continuation": {
+                "tool": "observe_jobs",
+                "arguments": {
+                    "items": [{"job_id": "wc_job_pending", "after_observation_token": "wj3_AAAAAAAAAAAAAAAAAAAAAA.1.0.0"}],
+                    "wait_secs": 5,
+                    "wake_on": "terminal"
+                }
+            },
+            "job_attention": attention
+        },
+        "error": null
+    });
+    test_support::validate_schema_instance(&pending, &cargo_check.output_schema)
+        .expect("strict cargo_check output must admit the generic passive sidecar");
+}
+
+#[test]
+fn passive_failure_diagnostics_schema_rejects_overflow_and_private_fields() {
+    let schema = output_schema_for_tool("cargo_check");
+    let field = &schema["properties"]["output"]["properties"]["job_attention"]["properties"]
+        ["items"]["items"]["properties"]["validation"]["properties"]["diagnostics"];
+    let safe = json!({"available": true, "diagnostic_count": 1,
+        "diagnostics": [{"severity": "error", "code": "E0308", "file": "src/foo.rs", "line": 123, "column": 9, "message": "expected X, found Y"}],
+        "returned_diagnostic_count": 1, "diagnostics_truncated": false,
+        "failed_test_details": [], "failed_test_details_truncated": false});
+    test_support::validate_schema_instance(&safe, field).unwrap();
+    let mut overflow = safe.clone();
+    overflow["diagnostics"] = json!(vec![safe["diagnostics"][0].clone(); 4]);
+    assert!(test_support::validate_schema_instance(&overflow, field).is_err());
+    for key in [
+        "stdout",
+        "stderr",
+        "command",
+        "argv",
+        "cwd",
+        "env",
+        "observation_token",
+        "provider_payload",
+    ] {
+        let mut leak = safe.clone();
+        leak[key] = json!("private");
+        assert!(
+            test_support::validate_schema_instance(&leak, field).is_err(),
+            "{key}"
+        );
+    }
 }
 
 #[test]
@@ -2951,16 +3124,18 @@ fn agent_wait_model_schema_preserves_bounded_join_sources_without_private_bookke
 }
 
 #[test]
-fn run_process_shell_recovery_schema_is_optional_and_failure_only() {
+fn run_process_shell_normalization_schema_is_success_only_and_payload_free() {
     let specs = registered_tool_specs();
     let spec = spec_named(&specs, "run_process");
-    let suggested = json!({"tool":"run_shell", "arguments":{"project":"demo","shell":"bash","command":"echo hello"}});
-    let failure = json!({"success":false,"output":{"command_started":false,
-        "command_completed":false,"execution_state":"not_started","failure_kind":"invalid_arguments",
-        "suggested_call":suggested},"error":"shell command mode rejected"});
-    test_support::validate_schema_instance(&failure, &spec.output_schema).unwrap();
-    let success = json!({"success":true,"output":{"suggested_call":suggested},"error":null});
-    assert!(test_support::validate_schema_instance(&success, &spec.output_schema).is_err());
+    let normalized = json!({"success":true,"output":{
+        "requested_surface":"run_process", "execution_source":"run_shell",
+        "input_normalization":{"code":"run_process_bash_c_to_run_shell",
+            "hint":"normalized run_process bash -c → run_shell"}
+    },"error":null});
+    test_support::validate_schema_instance(&normalized, &spec.output_schema).unwrap();
+    let mut invalid = normalized;
+    invalid["output"]["input_normalization"]["command"] = json!("private command");
+    assert!(test_support::validate_schema_instance(&invalid, &spec.output_schema).is_err());
 }
 
 #[test]

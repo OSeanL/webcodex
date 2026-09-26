@@ -318,14 +318,30 @@ async fn read_only_recording_session_does_not_guard_same_project_write() {
 #[tokio::test]
 async fn closed_recording_session_remains_provenance_only_for_business_write() {
     let tmp = tempfile::tempdir().unwrap();
-    let runtime = test_runtime();
+    let runtime = test_runtime().with_project_reference_database(std::sync::Arc::new(
+        crate::Database::open(&tmp.path().join("closed-recorder-refs.db")).unwrap(),
+    ));
     let project =
         register_runner_project_at_path(&runtime, "guard-closed-recorder", "demo", tmp.path())
             .await;
     let auth = auth_context(None, true);
+    let authority = crate::tool_runtime::workflow_session_authority_fingerprint(Some(&auth))
+        .expect("closed recorder auth should have stable authority");
     let recorder = runtime
         .sessions
-        .start_session(Some(project.clone()), Some("closed recorder".to_string()));
+        .start_session_with_options(
+            crate::tool_runtime::SessionCreateOptions::new(
+                Some(project.clone()),
+                Some("closed recorder".to_string()),
+                crate::tool_runtime::SessionMode::Normal,
+                crate::tool_runtime::SessionGuards::default(),
+            )
+            .with_owner_authority_fingerprint(Some(authority)),
+        )
+        .unwrap();
+    let recorder_ref = runtime
+        .session_reference_for_id(&recorder.session_id, Some(&auth))
+        .expect("closed recorder test should issue a Session ref before close");
     runtime
         .sessions
         .close_session(&recorder.session_id)
@@ -334,7 +350,7 @@ async fn closed_recording_session_remains_provenance_only_for_business_write() {
     let task = tokio::spawn({
         let runtime = runtime.clone();
         let project = project.clone();
-        let recorder_id = recorder.session_id.clone();
+        let recorder_id = recorder_ref;
         let auth = auth.clone();
         async move {
             runtime
@@ -796,6 +812,7 @@ async fn read_only_session_rejects_run_shell_before_agent_enqueue() {
     let result = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project,
                 command: "echo should-not-run".to_string(),
                 session_id: Some(session.session_id.clone()),
@@ -922,6 +939,7 @@ async fn deny_write_only_allows_read_and_shell_tools() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "exit 0".to_string(),
                         session_id: Some(session_id),
@@ -970,6 +988,7 @@ async fn deny_shell_only_allows_write_tools() {
     let denied = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project: project.clone(),
                 command: "echo blocked".to_string(),
                 session_id: Some(session.session_id.clone()),

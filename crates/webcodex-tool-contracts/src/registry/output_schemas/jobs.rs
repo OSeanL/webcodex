@@ -2,8 +2,9 @@ use serde_json::{json, Value};
 
 use super::common::{
     array_schema, cargo_test_count_assertion_schema, job_activity_schema, nullable_schema,
-    observe_job_continuation_schema, permission_decision_schema, recovery_kind_schema, schema_type,
-    session_hint_schema, suggested_tool_call_schema, wrapped_output_schema,
+    observe_job_continuation_schema, pending_job_strategy_schema, permission_decision_schema,
+    recovery_kind_schema, schema_type, session_hint_schema, suggested_tool_call_schema,
+    wrapped_output_schema,
 };
 
 fn validation_job_projection_schema() -> Value {
@@ -57,36 +58,23 @@ fn job_terminal_host_binding_schema() -> Value {
     })
 }
 
-fn run_process_shell_recovery_arguments_schema() -> Value {
-    fn scrub_exact_tool_name(value: &mut Value) {
-        match value {
-            Value::Object(object) => {
-                if let Some(Value::String(description)) = object.get_mut("description") {
-                    *description = description.replace("run_shell", "shell execution");
-                }
-                for child in object.values_mut() {
-                    scrub_exact_tool_name(child);
-                }
-            }
-            Value::Array(items) => {
-                for child in items {
-                    scrub_exact_tool_name(child);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut schema = crate::input_schema_for_tool("run_shell");
-    scrub_exact_tool_name(&mut schema);
-    schema
-}
-
 fn process_execution_state_schema() -> Value {
     json!({
         "type": "string",
-        "enum": ["not_started", "outcome_unknown", "completed", "timed_out", "queued", "running"],
-        "description": "Canonical lifecycle when explicit: not_started means no command dispatch; outcome_unknown means effects may have occurred and must be reconciled before retry; timed_out is terminal; queued/running appear only for durable Job handoff. Ordinary synchronous success omits this field because outer success already implies completed. Only explicit not_started is structurally safe to retry without first inspecting target state."
+        "enum": ["not_started", "outcome_unknown", "completed", "timed_out", "pending", "queued", "running"],
+        "description": "Model-facing lifecycle when explicit: pending is the normal same-execution durable handoff and carries only an exact fallback continuation; not_started means no command dispatch; outcome_unknown means effects may have occurred and must be reconciled before retry; timed_out is terminal. queued/running remain accepted only on exceptional/legacy receipts. Ordinary synchronous success omits this field because outer success already implies completed."
+    })
+}
+
+fn input_normalization_schema() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "description": "Present only after a successful, explicitly known lossless model-input normalization. No raw payload is repeated.",
+        "properties": {
+            "code": {"type": "string", "enum": ["argv_to_args", "run_process_sh_c_to_run_shell", "run_process_bash_c_to_run_shell", "run_process_bash_lc_to_login_run_shell"]},
+            "hint": {"type": "string", "maxLength": 80}
+        },
+        "required": ["code", "hint"]
     })
 }
 
@@ -98,7 +86,7 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
         {
             "if": {
                 "anyOf": [
-                    {"required": ["execution_state"]},
+                    {"properties": {"execution_state": {"not": {"const": "pending"}}}, "required": ["execution_state"]},
                     {"required": ["command_started"]},
                     {"required": ["command_completed"]},
                     {"required": ["command_ok"]},
@@ -183,6 +171,32 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
                         "command_started",
                         "command_completed"
                     ]
+                }
+            }
+        },
+        {
+            "if": {
+                "properties": {"execution_state": {"const": "pending"}},
+                "required": ["execution_state"]
+            },
+            "then": {
+                "required": ["continuation", "pending_strategy"],
+                "properties": {
+                    "continuation": continuation,
+                    "pending_strategy": pending_job_strategy_schema(),
+                    "job_id": {"enum": []},
+                    "job_status": {"enum": []},
+                    "observation_token": {"enum": []},
+                    "terminal": {"enum": []},
+                    "command_started": {"enum": []},
+                    "command_completed": {"enum": []},
+                    "command_ok": {"enum": []},
+                    "promoted_to_job": {"enum": []},
+                    "async_handoff_available": {"enum": []},
+                    "effective_timeout_secs": {"enum": []},
+                    "sync_wait_secs": {"enum": []},
+                    "activity": {"enum": []},
+                    "detected_summary": {"enum": []}
                 }
             }
         },
@@ -355,7 +369,7 @@ fn structured_continuation_properties() -> Vec<(&'static str, Value)> {
             "promoted_to_job",
             schema_type(
                 "boolean",
-                "Exceptional handoff receipt only. Normal durable handoff exposes job_id, job_status, terminal and the parser-ready continuation call.",
+                "Exceptional handoff receipt only. Normal successful durable handoff is execution_state=pending plus one parser-ready fallback continuation; canonical Job identity stays in registry/Session state.",
             ),
         ),
         (
@@ -369,14 +383,14 @@ fn structured_continuation_properties() -> Vec<(&'static str, Value)> {
             "job_id",
             nullable_schema(
                 "string",
-                "Durable continuation Job id. Non-promoted terminal execution may return null or omit this field according to the initiating tool's sparse contract.",
+                "Exceptional/recovery durable Job id. Normal successful pending handoff keeps identity in the continuation and canonical registry/Session state instead of repeating it at top level.",
             ),
         ),
         (
             "job_status",
             nullable_schema(
                 "string",
-                "Authoritative durable Job status. Non-promoted terminal execution may return null or omit this field according to the initiating tool's sparse contract.",
+                "Exceptional/recovery authoritative Job status. Normal successful pending handoff omits top-level Job lifecycle bookkeeping.",
             ),
         ),
         (
@@ -387,6 +401,7 @@ fn structured_continuation_properties() -> Vec<(&'static str, Value)> {
             ),
         ),
         ("continuation", observe_job_continuation_schema()),
+        ("pending_strategy", pending_job_strategy_schema()),
         ("suggested_call", list_jobs_recovery_call_schema(true)),
         ("activity", job_activity_schema()),
         (
@@ -413,7 +428,7 @@ fn structured_continuation_properties() -> Vec<(&'static str, Value)> {
         (
             "detected_summary",
             super::common::open_object_schema(
-                "Current bounded operation/build/check/test summary at the initial durable Job handoff; advisory only and never retry authority.",
+                "Exceptional/recovery bounded operation/build/check/test summary. Normal successful pending handoff omits this duplicated summary and relies on later sparse Job attention or explicit observation.",
             ),
         ),
     ]
@@ -864,6 +879,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ("status", schema_type("string", "Current detached Job status at admission.")),
                 ("project", schema_type("string", "Configured project id.")),
                 ("execution_source", schema_type("string", "Always run_detached_process on successful admission.")),
+                ("input_normalization", input_normalization_schema()),
                 ("purpose", schema_type("string", "Declared execution purpose.")),
                 ("process_summary", schema_type("string", "Bounded body-free detached process summary.")),
                 ("cwd", schema_type("string", "Resolved project-relative cwd.")),
@@ -922,7 +938,27 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "skill_definition_revision",
                 "skill_package_revision",
             ] {
-                require_success_output_field(&mut schema, field);
+                schema["allOf"]
+                    .as_array_mut()
+                    .expect("run_skill_resource top-level constraints")
+                    .push(json!({
+                        "if": {
+                            "properties": {
+                                "success": {"const": true},
+                                "output": {
+                                    "properties": {
+                                        "execution_state": {"not": {"const": "pending"}}
+                                    }
+                                }
+                            },
+                            "required": ["success", "output"]
+                        },
+                        "then": {
+                            "properties": {
+                                "output": {"required": [field]}
+                            }
+                        }
+                    }));
             }
             Some(schema)
         }
@@ -1011,8 +1047,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 })),
                 (
                     "execution_source",
-                    schema_type("string", "Canonical source is run_process. Diagnostic telemetry: omitted on ordinary synchronous terminal success when canonical and from the default model-facing failure projection."),
+                    schema_type("string", "Canonical executed surface; may differ from the requested surface after proven exact shell-input recovery."),
                 ),
+                ("requested_surface", schema_type("string", "Original requested tool name when an exact shell form was normalized.")),
+                ("input_normalization", input_normalization_schema()),
                 (
                     "execution_state",
                     process_execution_state_schema(),
@@ -1027,15 +1065,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ];
             properties.extend(structured_continuation_properties());
             let mut schema = wrapped_output_schema(properties);
-            schema["properties"]["output"]["properties"]["suggested_call"] = json!({"anyOf": [
-                list_jobs_recovery_call_schema(true),
-                suggested_tool_call_schema(
-                    "run_shell", run_process_shell_recovery_arguments_schema(),
-                    "Failure-only advisory conversion proven lossless and rejected before process start. Never retry authority after execution may have started."
-                )
-            ]});
-            schema["properties"]["output"]["properties"]["execution_source"]["const"] =
-                json!("run_process");
+            schema["properties"]["output"]["properties"]["suggested_call"] =
+                list_jobs_recovery_call_schema(true);
+            schema["properties"]["output"]["properties"]["execution_source"]["enum"] =
+                json!(["run_process", "run_shell"]);
             schema["properties"]["output"]["allOf"] =
                 structured_execution_lifecycle_constraints("run_process");
             schema["allOf"] = json!([{
@@ -1146,7 +1179,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             properties.extend(structured_continuation_properties());
             let mut schema = wrapped_output_schema(properties);
             schema["properties"]["output"]["properties"]["language"]["enum"] =
-                json!(["sh", "bash", "powershell", "javascript", "typescript"]);
+                json!(["sh", "bash", "powershell", "python", "javascript", "typescript"]);
             schema["properties"]["output"]["properties"]["execution_source"]["const"] =
                 json!("run_script");
             schema["properties"]["output"]["allOf"] =
@@ -1235,7 +1268,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "shell",
                     schema_type(
                         "string",
-                        "Actual selected shell, configured executor shell, or remote SSH executor.",
+                        "Actual selected shell (bash_login for explicit login mode), configured executor shell, or remote SSH executor.",
                     ),
                 ),
                 ("executor", json!({

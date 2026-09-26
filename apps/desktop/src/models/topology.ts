@@ -120,13 +120,14 @@ export interface TunnelProxySnapshot {
   mode: TunnelProxyMode;
   custom_url?: string | null;
   effective_source: string;
-  effective_url?: string | null;
-  detected_url?: string | null;
+  effective_proxy_present: boolean;
+  system_proxy_detected: boolean;
 }
 
 export type DesktopOperationKind =
   | "local_setup"
   | "local_project_activate"
+  | "project_unregister"
   | "remote_setup"
   | "quick_share_start"
   | "quick_share_stop"
@@ -138,7 +139,8 @@ export type DesktopOperationKind =
   | "tunnel_proxy_update"
   | "tunnel_config_update"
   | "runner_settings_update"
-  | "runner_restart";
+  | "runner_restart"
+  | "runtime_probe" | "runtime_switch" | "trace_update" | "configuration_restore";
 
 export type DesktopOperationPhase = "running" | "cancelling";
 
@@ -169,6 +171,8 @@ export interface ChatGptActivitySnapshot {
 }
 
 export interface DesktopState {
+  workspace_runner?: SettingsTarget | null;
+  configuration_issue?: string | null;
   saved_projects?: ProjectSelection[];
   topology?: RuntimeTopology | null;
   readiness: ReadinessSnapshot;
@@ -179,6 +183,7 @@ export interface DesktopState {
   quick_share?: QuickShareState | null;
   connections?: import("./connections-tools").ConnectionsSnapshot;
   mcp_providers?: import("./connections-tools").McpProvidersSnapshot;
+  coding_agents?: import("./runner-capabilities").CodingAgentsSnapshot;
   current_operation?: DesktopOperation | null;
   activity_sequence: number;
   openai_tunnel_configured: boolean;

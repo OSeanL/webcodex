@@ -43,7 +43,11 @@ fn validate_coding_agent_registration(
     inventory: Option<&CodingAgentRunInventory>,
 ) -> Result<(), String> {
     match (capability, providers, inventory) {
-        (false, None, None) => return Ok(()),
+        // Older/no-ACP Runners may serialize the optional provider list as []
+        // instead of null/absent. Empty discovery grants no execution capability.
+        (false, providers, None) if providers.is_none_or(|providers| providers.is_empty()) => {
+            return Ok(())
+        }
         (false, _, _) => {
             return Err(
                 "coding-agent provider/inventory metadata requires coding_agent_runs capability"
@@ -1239,6 +1243,39 @@ impl RunnerRegistry {
             })
             .filter_map(|id| Self::runner_semantic_view_locked(&inner, &id))
             .collect()
+    }
+
+    /// Exact Project visibility from the registered Runner snapshot. This is
+    /// deliberately read-only: diagnostic observations must not reconcile Jobs
+    /// or prune Runner records as a side effect of checking visibility.
+    pub async fn exact_project_visible_for_auth_snapshot(
+        &self,
+        auth: Option<&crate::RunnerAccess>,
+        project: &str,
+    ) -> bool {
+        let now = now_ts();
+        let inner = self.inner.lock().await;
+        inner.runners.values().any(|runner| {
+            if !runner_visible_to_access(auth, runner) {
+                return false;
+            }
+            if matches!(runner.auth_group, Some(RunnerAccessGroup::SharedKey(_))) {
+                let connected = inner.notifiers.contains_key(&runner.client_id);
+                let recently_seen =
+                    now.saturating_sub(runner.last_seen) <= RUNNER_ONLINE_WINDOW_SECS;
+                let offline_since = runner.disconnected_at.unwrap_or(runner.last_seen);
+                if !connected
+                    && !recently_seen
+                    && now.saturating_sub(offline_since) > self.shared_key_limits.offline_ttl_secs
+                {
+                    return false;
+                }
+            }
+            runner
+                .projects
+                .iter()
+                .any(|entry| project == format!("agent:{}:{}", runner.client_id, entry.id))
+        })
     }
 
     /// Return a complete canonical Runner/Project observation only when both

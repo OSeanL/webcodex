@@ -500,20 +500,20 @@ async fn http_runtime_status_correct_bearer_returns_summary() {
     let out = &body["output"];
     assert_eq!(out["service"], "webcodex");
     assert_eq!(out["version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(out["projects"]["mode"], "agent_registered");
+    assert_eq!(out["projects"]["mode"], "runner_registered");
     assert!(out["projects"].get("configured").is_none());
     assert!(out["projects"].get("server_static").is_none());
     assert_eq!(out["projects"]["count"], 1);
-    assert_eq!(out["projects"]["agent_registered"]["count"], 1);
-    assert_eq!(out["projects"]["agent_registered"]["online_count"], 1);
+    assert_eq!(out["projects"]["runner_registered"]["count"], 1);
+    assert_eq!(out["projects"]["runner_registered"]["online_count"], 1);
     assert_eq!(out["projects"]["effective"]["count"], 1);
     assert_eq!(out["projects"]["effective"]["status"], "ok");
-    assert!(out["agents"]["count"].is_i64());
+    assert!(out["runners"]["count"].is_i64());
     assert!(out["jobs"]["active_count"].is_i64());
     assert!(out["jobs"]["running_count"].is_i64());
     assert!(out["jobs"]["queued_count"].is_i64());
     assert_eq!(
-        out["agents"]["clients"][0]["job_concurrency"],
+        out["runners"]["clients"][0]["job_concurrency"],
         json!({"limit": null, "running": 0, "queued": 0})
     );
     assert!(out["tools"]["count"].is_i64());
@@ -661,21 +661,21 @@ fn http_runtime_status_after_runner_registration_fits_default_worker_stack() {
             assert_eq!(effective_status(&status), StatusCode::OK);
             let body: Value = status.take_json().await.unwrap();
             assert_eq!(body["success"], true);
-            assert_eq!(body["output"]["agents"]["count"], 1);
+            assert_eq!(body["output"]["runners"]["count"], 1);
             assert_eq!(
-                body["output"]["agents"]["clients"][0]["client_id"],
+                body["output"]["runners"]["clients"][0]["client_id"],
                 "status-stack-runner"
             );
             assert_eq!(
-                body["output"]["agents"]["clients"][0]["build"]["built_at"],
+                body["output"]["runners"]["clients"][0]["build"]["built_at"],
                 "100"
             );
             assert_eq!(
-                body["output"]["agents"]["clients"][0]["build"]["target"],
+                body["output"]["runners"]["clients"][0]["build"]["target"],
                 "x86_64-unknown-linux-gnu"
             );
             assert_eq!(
-                body["output"]["agents"]["clients"][0]["build"]["architecture"],
+                body["output"]["runners"]["clients"][0]["build"]["architecture"],
                 "x86_64"
             );
         })
@@ -1579,6 +1579,76 @@ async fn api_tools_call_accepts_hidden_testing_metadata_and_records_expectation(
 }
 
 #[tokio::test]
+async fn api_hidden_handoff_state_reads_exact_session_without_recording_it() {
+    let config = test_config(Some("secret"));
+    let (_db_tmp, db) = test_db();
+    let project_tmp = tempfile::tempdir().unwrap();
+    std::fs::write(project_tmp.path().join("README.md"), "hello\n").unwrap();
+    let (runtime, registry) = register_import_agent_with_capabilities(
+        project_tmp.path(),
+        Some(crate::runner_protocol::RunnerCapabilities {
+            shell: true,
+            git: true,
+            ..Default::default()
+        }),
+    )
+    .await;
+    let executor = spawn_startup_agent_executor(registry);
+    let service = Service::new(build_projects_router(config, db, runtime.clone()));
+    let project = "agent:importer:demo";
+
+    let mut resp = TestClient::post("http://localhost/api/tools/call")
+        .bearer_auth("secret")
+        .json(&json!({
+            "tool": "start_session",
+            "params": {"project": project, "title": "local handoff target"}
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(effective_status(&resp), StatusCode::OK);
+    let start_body: Value = resp.take_json().await.unwrap();
+    let session_id = start_body["output"]["session_id"]
+        .as_str()
+        .expect("start_session id")
+        .to_string();
+    let before = runtime
+        .sessions
+        .summary(&session_id, None)
+        .expect("business Session before hidden handoff read");
+
+    let mut resp = TestClient::post("http://localhost/api/tools/call")
+        .bearer_auth("secret")
+        .json(&json!({
+            "tool": "session_handoff_state",
+            "params": {"project": project, "session_id": session_id}
+        }))
+        .send(&service)
+        .await;
+    let status = effective_status(&resp);
+    let body: Value = resp.take_json().await.unwrap();
+    executor.abort();
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["success"], true, "{body}");
+    assert_eq!(body["output"]["project"], project);
+    assert_eq!(body["output"]["session_id"], session_id);
+    assert_eq!(
+        body["output"]["handoff_brief"]["session"]["session_id"],
+        session_id
+    );
+    assert_eq!(
+        body["output"]["handoff_brief"]["external_observations"]["provenance"],
+        "external_report"
+    );
+    let after = runtime
+        .sessions
+        .summary(&session_id, None)
+        .expect("business Session after hidden handoff read");
+    assert_eq!(after.events_total, before.events_total);
+    assert_eq!(after.updated_at, before.updated_at);
+}
+
+#[tokio::test]
 async fn api_tools_call_uses_recording_session_id_for_recorder_metadata() {
     let (_tmp, service) = phase2_service();
     let mut resp = TestClient::post("http://localhost/api/tools/call")
@@ -1837,23 +1907,33 @@ async fn http_tools_call_rejects_arguments_even_when_params_are_present() {
 }
 
 #[tokio::test]
-async fn http_tools_call_rejects_app_only_work_result_state() {
+async fn http_tools_call_rejects_app_only_work_result_operations() {
     let (_tmp, service) = phase2_service();
-    let (status, body) = http_tool_call(
-        &service,
-        json!({
-            "tool": "work_result_state",
-            "params": {
+    for (tool, params) in [
+        (
+            "work_result_state",
+            json!({
                 "project": "agent:canonical:p",
                 "session_id": format!("wc_sess_{}", "1".repeat(32))
-            }
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(body["error"]
-        .as_str()
-        .is_some_and(|error| error.contains("Work Result App state")));
+            }),
+        ),
+        (
+            "work_result_send_message",
+            json!({
+                "project": "agent:canonical:p",
+                "session_id": format!("wc_sess_{}", "1".repeat(32)),
+                "message": "hello",
+                "delivery_key": "http-must-not-call-app-tool"
+            }),
+        ),
+    ] {
+        let (status, body) =
+            http_tool_call(&service, json!({"tool": tool, "params": params})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{tool}: {body}");
+        assert!(body["error"].as_str().is_some_and(|error| {
+            error.contains("Work Result App") && error.contains("Stateless MCP 2026")
+        }));
+    }
 }
 
 #[tokio::test]

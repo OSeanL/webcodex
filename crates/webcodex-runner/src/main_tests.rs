@@ -367,6 +367,7 @@ fn json_file_op_request(
     payload: serde_json::Value,
 ) -> RunnerRequest {
     RunnerRequest {
+        login: false,
         shell: None,
         request_id: format!("req-{kind}"),
         client_id: "agent-1".to_string(),
@@ -859,6 +860,7 @@ fn shell_job_native_exe_nonzero_exit_code_is_preserved() {
     // fixture. This test only verifies PowerShell native-exit propagation; a freshly
     // generated EXE can be delayed by Windows malware scanning under parallel CI and
     // would turn that unrelated startup latency into a false shell timeout.
+    // Allow time for PowerShell startup on a busy Windows CI host as well.
     let command_processor = std::env::var_os("ComSpec")
         .map(PathBuf::from)
         .filter(|path| path.is_file())
@@ -876,7 +878,7 @@ fn shell_job_native_exe_nonzero_exit_code_is_preserved() {
         Some(&cwd),
         &command,
         None,
-        10,
+        30,
         None,
     );
     assert_eq!(result.exit_code, Some(3), "{result:?}");
@@ -1048,6 +1050,7 @@ fn project_policy(root: &Path) -> RunnerPolicy {
 
 fn project_request(kind: &str, payload: serde_json::Value) -> RunnerRequest {
     RunnerRequest {
+        login: false,
         shell: None,
         request_id: format!("req-{}", kind),
         client_id: "oe".to_string(),

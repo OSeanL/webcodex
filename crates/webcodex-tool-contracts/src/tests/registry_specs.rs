@@ -498,28 +498,21 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let run_shell_desc = desc("run_shell");
     for phrase in [
-        "bounded shell command or short related chain",
-        "shell semantics",
-        "predetermined related observations may share one call",
-        "adaptive/result-dependent follow-ups stay sequential",
+        "bounded shell grammar or a short related command chain",
         "prefer run_process for literal argv",
-        "deterministic python heredoc",
-        "one coherent transformation",
-        "project/path/permission policy",
-        "avoid unauthorized network",
-        "inspect diff",
-        "validate final source",
-        "run_script handles program-like languages",
-        "failure/permission/validation boundaries",
-        "commit, push, deploy, restart",
-        "same-process state",
-        "one named ssh resource",
-        "runner-owned",
+        "run_script for program-like scripts",
+        "predetermined related observations may share one command",
+        "result-dependent follow-ups stay sequential",
+        "project-source mutation should normally use canonical structured editors",
+        "runner-owned execution",
         "timeout_secs is total lifetime",
-        "sync_wait_secs is job-handoff grace",
-        "later observe wait is one observation",
-        "duration does not select the primitive",
-        "run_detached_process",
+        "server timing policy controls job-handoff grace",
+        "execution_state=pending",
+        "continue independent work",
+        "sparse terminal job attention",
+        "observe_jobs only for logs/details/recovery",
+        "wait_for_job_terminal only when terminal outcome is a true dependency",
+        "duration alone does not select a detached primitive",
     ] {
         assert!(
             run_shell_desc.contains(phrase),
@@ -529,19 +522,20 @@ fn tool_specs_describe_default_coding_loop_preferences() {
 
     let run_process_desc = desc("run_process");
     for phrase in [
-        "one-shot executable with structured argv",
-        "preferred route for one native executable with literal argv",
+        "native executable with structured literal argv",
+        "prefer this over run_shell unless shell grammar or a short related command chain is required",
         "windows batch shims",
         "bounded runner-owned quoting contract",
-        "run_shell only when shell semantics or a short tightly related command chain",
-        "do not open a persistent shell merely to run several commands",
-        "same-process cwd/env/exports/functions/umask state",
-        "one named ssh resource",
-        "ssh_resource onboarding",
-        "one-shot/no-persistence ssh",
-        "runner-owned",
-        "outlive the runner",
+        "persistent shell is only for retained same-process or named-ssh state, not command count",
+        "same execution and remains runner-owned",
+        "execution_state=pending",
+        "continue independent work",
+        "sparse terminal job attention",
+        "observe_jobs only for logs/details/recovery",
+        "wait_for_job_terminal only when terminal outcome is a true dependency",
         "run_detached_process",
+        "survive runner restart/upgrade/stop/replacement",
+        "duration alone is not a reason to detach",
     ] {
         assert!(
             run_process_desc.contains(phrase),
@@ -549,30 +543,23 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         );
     }
 
+    // Interpreter/runtime details stay locked by run_script input-schema tests;
+    // this model-facing description test keeps selection and lifecycle decisions dense.
     let run_script_desc = desc("run_script");
     for phrase in [
-        "sh, bash, powershell, javascript, or typescript",
-        "node.js-backed",
-        ".mjs",
-        "native erasable type stripping",
-        ".mts",
-        "node.js 22.6+",
-        "does not type-check",
-        "enum",
-        "runner owns runtime selection/flags",
-        "does not install npm dependencies",
-        "relative esm imports resolve from the runner-owned temporary module",
-        "bun",
-        "deno",
-        "tsx",
-        "run tsc",
+        "sh, bash, powershell, python, javascript, or typescript",
         "run_process for native argv",
-        "run_script for program-like scripts",
-        "run_shell when shell grammar is required",
-        "same execution / same job",
-        "never restarted",
-        "outlive the runner",
-        "run_detached_process",
+        "computation/inspection/generation/non-source transforms",
+        "run_shell for shell grammar",
+        "project-source mutation should normally use canonical structured editors",
+        "same execution and remains runner-owned",
+        "execution_state=pending",
+        "continue independent work",
+        "sparse terminal job attention",
+        "observe_jobs only for logs/details/recovery",
+        "wait_for_job_terminal only when terminal outcome is a true dependency",
+        "script bodies never become shell command text",
+        "survive runner restart/upgrade/stop/replacement",
     ] {
         assert!(
             run_script_desc.contains(phrase),
@@ -727,17 +714,17 @@ fn removed_legacy_edit_tools_are_not_known_tools() {
 fn model_preference_upper_bounds_are_clamped_by_runtime_not_rejected_by_schema() {
     let specs = registered_tool_specs();
     let cases: &[(&str, &[&str])] = &[
-        ("run_process", &["timeout_secs", "sync_wait_secs"]),
+        ("run_process", &["timeout_secs"]),
         ("run_detached_process", &["timeout_secs"]),
-        ("run_script", &["timeout_secs", "sync_wait_secs"]),
+        ("run_script", &["timeout_secs"]),
         ("run_shell", &["timeout_secs"]),
         ("session_shell_exec", &["timeout_secs"]),
         ("observe_jobs", &["tail_lines", "wait_secs"]),
         ("list_jobs", &["limit"]),
-        ("cargo_fmt", &["timeout_secs", "sync_wait_secs"]),
-        ("cargo_check", &["timeout_secs", "sync_wait_secs"]),
-        ("cargo_test", &["timeout_secs", "sync_wait_secs"]),
-        ("go_test", &["timeout_secs", "sync_wait_secs"]),
+        ("cargo_fmt", &["timeout_secs"]),
+        ("cargo_check", &["timeout_secs"]),
+        ("cargo_test", &["timeout_secs"]),
+        ("go_test", &["timeout_secs"]),
         ("session_discussion_summary", &["limit"]),
         ("workspace_hygiene_check", &["max_findings"]),
         ("list_projects", &["limit"]),
@@ -1099,24 +1086,12 @@ fn observe_jobs_wake_policy_schema_is_closed_and_compatible() {
     ] {
         assert!(spec.description.contains(phrase), "missing {phrase}");
     }
-    let recommended_wait = format!(
-        "wait_secs={}",
-        webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS
-    );
-    assert!(
-        spec.description.contains(&recommended_wait),
-        "missing {recommended_wait}"
-    );
     let wait_description = spec.input_schema["properties"]["wait_secs"]["description"]
         .as_str()
         .unwrap();
     assert!(wait_description.contains("above 100 seconds"));
     assert!(wait_description.contains("clamped to 100"));
-    let recommended_wait_description = format!(
-        "recommend {} seconds",
-        webcodex_core::runtime_contract::MODEL_JOB_CONTINUATION_WAIT_SECS
-    );
-    assert!(wait_description.contains(&recommended_wait_description));
+    assert!(wait_description.contains("MCP transport may clamp"));
     assert!(wait_description.contains("further useful progress depends on terminal outcome"));
     assert!(wait_description.contains("independent work continues"));
     let wake_description = wake["description"].as_str().unwrap();

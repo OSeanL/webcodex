@@ -59,21 +59,45 @@ that the current model retained either material.
 
 When bootstrap or discovery returns `project_ref`, reuse it as the `project` selector on ordinary Project-scoped calls. The canonical `agent:<client_id>:<project_id>` identity remains visible for diagnostics and explicit addressing, but the model does not need to mechanically repeat it. A short ref is Server-owned, durable and principal-scoped, carries no authority, and is reauthorized against its pinned canonical Project/root identity on every call.
 
+When `work_on_project`, `start_session`, `session_summary`, or an explicit handoff returns `session_ref`, prefer that short selector for later explicit Session selection. Business `session_id` and wrapper `recording_session_id` remain separate contracts, but either may explicitly carry the already-issued ref: Runtime canonicalizes it to the pinned `wc_sess_*` before the role-specific authorization and lifecycle/guard logic runs. The canonical identity remains valid and authoritative. The ref is principal-scoped convenience only; omission never infers a recorder and no sticky recorder context is created.
+
 ## Tool strategy guidance
 
-`work_on_project` accepts `guidance_profile`, defaulting to `direct`. Workflow
-contract v16 returns shared `guidance`, `model_protocol` and review `roles`, plus
-only the selected `tool_strategy: {profile, guidance}`, when explicitly requested
-through `context_request=["webcodex.workflow"]`. The selection is request-local:
-choose again on exact resume without changing Session identity or business state.
-It is never inferred from a Window, Session or past tool use, and grants no tools,
-admission, authority or execution semantics. Builds without Experimental Code Mode
-reject explicit `code_mode` as an invalid profile. On a `work_on_project` call the
-workflow sidecar uses that call's `guidance_profile`; unrelated tools that request
-`webcodex.workflow` use the canonical default `direct` profile.
+`work_on_project` accepts an optional `guidance_profile`. An explicit value always
+wins. When omitted on MCP, the configured `WEBCODEX_MCP_HOST_PROFILE` supplies the
+model-guidance default; omission on non-MCP/internal calls falls back to `direct`.
+Workflow contract v21 returns shared `guidance`, `model_protocol` and review `roles`,
+plus only the selected `tool_strategy`, when explicitly requested through
+`context_request=["webcodex.workflow"]`. The selection is request-local: choose again
+on exact resume without changing Session identity or business state. It is never
+remembered from a Window, Session or past tool use, and grants no tools, admission,
+authority or execution semantics. Builds without Experimental Code Mode reject
+explicit `code_mode` as an invalid profile. Startup and later `webcodex.workflow`
+context refreshes use the same effective-profile rule.
 
 - `direct`: use the simplest sufficient primitive; batch predetermined independent
   observations and let the model inspect results before adaptive follow-up calls.
+- `host_code_mode`: use Host-native orchestration when the Host provides it. Prefer a
+  tool's native batch for predetermined same-kind inputs before Host concurrency.
+  Predetermined independent cross-tool read-only observations may run in parallel;
+  after native batches, prefer `Promise.allSettled` when partial evidence remains useful
+  and `Promise.all` only for true all-or-nothing fan-out. Result-dependent
+  search/read/branch chains should stay in one Host cell when the next call is
+  mechanically determined. A child ToolResult arriving is not itself a
+  model-turn boundary: return to the model for semantic choices, ambiguity, new user
+  decisions, authority/permission requirements, uncertain outcomes, competing
+  recovery choices, or unresolved mutation intent. Keep full ToolResults in the Host
+  cell and return compact decision evidence. Treat each Host cell as a short dependency
+  DAG, not a long-running Job lifetime. After Job handoff, retain exact identity and
+  continue already-known independent work; if the remaining work is primarily waiting,
+  end the cell and resume from the exact continuation instead of holding it open. Avoid
+  mechanical `observe_jobs` polling. The
+  startup `tool_strategy.host_orchestration` catalog and exact
+  `tool_manifest(tool_name=...)` hint are both derived from canonical
+  `ToolDefinition` metadata. They are guidance only and do not alter
+  `ToolCompositionPolicy`, authority, effects, permissions, retry, idempotency, or
+  runtime scheduling; broad/default ToolSpecs do not carry them. This profile grants
+  no WebCodex capability or authority and does not require nested WebCodex Code Mode.
 - `code_mode`: still use a direct primitive for one simple observation. Prefer
   read-only orchestration when related search/read work, cross-file investigation
   or synthesis saves outer model turns. Keep dependent follow-ups sequential inside
@@ -81,7 +105,7 @@ workflow sidecar uses that call's `guidance_profile`; unrelated tools that reque
   the cell, filter and synthesize them, then emit compact decision evidence through
   `text(...)`. Avoid `text(results)` dumps and project before reaching output limits.
 
-Both strategies retain bounded targeted reads, narrow discovery, first-class native
+All strategies retain bounded targeted reads, narrow discovery, first-class native
 commands/structured tools, and the same recovery, authority, review and closeout.
 Canonical edits and structured validators remain the default. Effectful composition
 is useful only when related validations save outer turns; guarded mutation composition
@@ -116,7 +140,9 @@ Formatting is finalization, not per-edit validation. The normal loop is edit →
 
 Prefer structured validation such as `cargo_test`, `cargo_check`, or `go_test` when available. Use the smallest check that can detect the regression, and broaden only when the affected boundary requires it.
 
-When a required validation is likely to outlast its synchronous grace and independent read-only inspection remains, set a short `sync_wait_secs` (often `1`) so that already-started validation hands off as the **same execution** Job. Continue only independent reads, search, diff/architecture inspection, or review, then observe that Job. Do not start extra CPU-heavy validations merely for parallelism. If source covered by the running validation changes afterward, its result is stale/cache-warmup evidence rather than proof of the final workspace; run task-appropriate validation again on the final source.
+For one Cargo workspace package, `cargo_check` accepts `package`. For several packages, pass `packages`; WebCodex sorts and deduplicates that set, then runs one Cargo process with repeated `-p` selectors. The two selectors are mutually exclusive, and an explicit empty list is invalid.
+
+When a required validation outlasts its Server-managed synchronous grace, it hands off automatically as the **same execution** Job. The model should not tune handoff timing. Continue only independent reads, search, diff/architecture inspection, or review, then observe that Job. Do not start extra CPU-heavy validations merely for parallelism. If source covered by the running validation changes afterward, its result is stale/cache-warmup evidence rather than proof of the final workspace; run task-appropriate validation again on the final source.
 
 When a test invocation must prove that tests actually ran, use `require_tests: true` or `min_tests: N`. These are request-scoped evidence assertions, not persistent Workflow Session requirements. If validator execution succeeds but the requested count cannot be satisfied or proven, closeout retains that invocation as an evidence gap rather than a code/test correctness failure. Otherwise, an exit-zero command that legitimately runs zero tests remains an execution result rather than proof of test coverage.
 
@@ -132,7 +158,7 @@ Review the actual workspace/diff after editing and validation. Passing tests do 
 
 ## Long-running work
 
-A command or validation that outlives the synchronous grace period continues as the same WebCodex Job. Keep its exact Job identity and parser-ready continuation. If useful independent work remains, continue that work and observe the Job later; do not repeatedly poll a running Job merely to keep it visible. When the next useful action actually depends on the terminal result, use the provided host-safe `wait_secs=55, wake_on=terminal` continuation. The Runtime still accepts explicit observation waits up to 100 seconds, but longer model-facing waits can exceed an outer MCP Host deadline. For one Job or when any terminal result unblocks progress, use `terminal`; when every Job in a predetermined set is required before progress, use `all_terminal`. Recovery/continuation hints never authorize a retry of an uncertain effect.
+A command or validation that outlives the synchronous grace period continues as the same WebCodex Job. Keep its exact Job identity and parser-ready continuation. If useful independent work remains, continue that work and observe the Job later; do not repeatedly poll a running Job merely to keep it visible. When the next useful action actually depends on the terminal result, use the returned continuation; the Server bounds its observation wait for the configured MCP Host profile. The Runtime still supports its transport-neutral observation ceiling internally, while MCP waiting is adapted to the Host budget. For one Job or when any terminal result unblocks progress, use `terminal`; when every Job in a predetermined set is required before progress, use `all_terminal`. Recovery/continuation hints never authorize a retry of an uncertain effect.
 
 ## Manual multi-window collaboration
 

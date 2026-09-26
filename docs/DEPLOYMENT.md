@@ -174,6 +174,26 @@ one-time migration boundary: the installer fails closed rather than competing
 for the live address. Stop the legacy Server first, then rerun the install with
 `--overwrite`. This boundary does not provide a gap-free first migration.
 
+### MCP Host timing profile
+
+MCP call waiting is a Server-side Host adaptation and is configured independently of Runner execution timeouts. Ordinary MCP Hosts use the default `direct` profile, so no setting is normally required:
+
+```text
+WEBCODEX_MCP_HOST_PROFILE=direct
+```
+
+For a Host that provides native Code Mode/orchestration with an approximately 55-second wall-clock budget for the whole composition, select:
+
+```text
+WEBCODEX_MCP_HOST_PROFILE=host_code_mode
+# Optional: host_code_mode already defaults to 55 seconds.
+WEBCODEX_MCP_HOST_BUDGET_SECS=55
+```
+
+`WEBCODEX_MCP_HOST_BUDGET_SECS` describes the Host-side MCP call/composition budget, not command runtime. Tool `timeout_secs` remains the execution lifetime and may be much larger. WebCodex never infers the profile from `clientInfo`, User-Agent, or a Host product name.
+
+`host_code_mode` describes orchestration supplied by the external MCP Host. It is separate from WebCodex's experimental internal Code Mode feature and its own nested-execution safeguards. `runtime_status` reports the effective non-secret policy under `effective_config.mcp_host`.
+
 ### Tool invocation tracing
 
 Tool-request tracing is an **operator diagnostic** and is disabled by default. Use metadata mode for lightweight lifecycle diagnostics; use `full` only when you explicitly need request/response payload capture:
@@ -453,14 +473,17 @@ curl -fsS -X POST https://your-domain.example/api/oauth/clients/create \
 
 `allowed_scopes` limits what an OAuth client may request. Existing clients are not silently widened when WebCodex adds new permissions. To change an existing client, submit the complete desired non-empty allow-list to `POST /api/oauth/clients/update_scopes`. A real change invalidates the client's old OAuth grants and requires reauthorization; submitting the same canonical list is a no-op. See [Authentication](AUTH_MODEL.md#oauth2) for the security model.
 
-ChatGPT MCP host-file import uses two trust tiers. An active authenticated OAuth client may import only from `files.oaiusercontent.com` or its subdomains; those URLs still require HTTPS, public DNS resolution with address pinning, port 443, no userinfo, no redirects, and the normal bounded download/write policy. Configure an exact server-generated OAuth client id in `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS` only when that client must also import from arbitrary public HTTPS hosts under the same SSRF controls. Reprovisioning changes the client id but does not break ordinary OpenAI-host attachment import; update the setting to restore the broader Tier 1 trust. Client display names and redirect URIs never grant Tier 1 trust.
+ChatGPT MCP host-file import uses two trust tiers. An active authenticated OAuth client may import only from OpenAI attachment hosts: `files.oaiusercontent.com` and its subdomains, plus the narrowly matched Sediment Azure Blob accounts `oaisdmntpr<region>.blob.core.windows.net`; those URLs still require HTTPS, public DNS resolution with address pinning, port 443, no userinfo, no redirects, and the normal bounded download/write policy. Configure an exact server-generated OAuth client id in `WEBCODEX_OAUTH2_TRUSTED_MCP_FILE_CLIENT_IDS` only when that client must also import from arbitrary public HTTPS hosts under the same SSRF controls. Reprovisioning changes the client id but does not break ordinary OpenAI-host attachment import; update the setting to restore the broader Tier 1 trust. Client display names and redirect URIs never grant Tier 1 trust.
 
 A separate local-only exception exists for an operator-controlled Server that is
-bound to loopback and reached through OpenAI Secure Tunnel with a locally
-injected user API token. Set
+bound to loopback and reached through OpenAI Secure Tunnel. Set
 `WEBCODEX_MCP_TRUST_LOOPBACK_API_TOKEN_FILE_IMPORT=true` to trust ChatGPT
-host-file rewrites on that path. The flag is ignored for non-loopback binds and
-for non-user API credentials; leave it unset on network-accessible Servers.
+host-file rewrites only when that request is authenticated by an allowed local
+credential: a normal user API token, or the configured Server bootstrap credential
+used by the regular Desktop Tunnel. That Tunnel derives the credential from the local
+`WEBCODEX_TOKEN` configuration and injects it privately; do not copy or expose it.
+The flag is ignored for non-loopback binds and all other credential classes; leave it
+unset on network-accessible Servers.
 
 List and revoke clients with `POST /api/oauth/clients/list` and
 `POST /api/oauth/clients/revoke`. OAuth uses the authorization-code flow;
